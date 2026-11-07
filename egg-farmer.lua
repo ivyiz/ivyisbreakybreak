@@ -475,7 +475,7 @@ local function zoneIndexFromId(zoneId)
     return tonumber(string.match(zoneId, "%d+"))
 end
 
-local GUARD_SAFE_DEFAULT = 120
+local GUARD_SAFE_DEFAULT = 80
 
 local function zoneSafeDist(zoneIndex)
     if CONFIG.guardSafeDist and CONFIG.guardSafeDist > 0 then
