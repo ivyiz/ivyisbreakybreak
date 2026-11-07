@@ -14,7 +14,8 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 - Auto-drop carried pets at Zone 1 or Safe Zone.
 - Boss pet-drop recovery: if a boss pet is taken from you, the script walks back and re-steals it.
 - Auto collect gems: after a gem drop the script walks onto the pieces so the magnet picks them up.
-- Movement tab: speed boost up to 200% of your base walk speed, auto-tuned to the fastest value the server accepts, with noclip while travelling and snapback alerts.
+- Start-zone eggs first: eggs closest to the zone entrance are always picked first, even if that means walking back.
+- Guard gate: only steals pets or starts a new egg when the nearest ZoneGuard is far enough away (half the zone length).
 - Never freezes in place: if the character stops making progress it jumps and sidesteps until it moves again.
 - Swing rate follows the game's own cooldown, so pickaxe tiers, the x2 fast-swing gamepass, swing potions and Swinging mastery all apply automatically.
 - Auto rejoin on disconnect.
@@ -26,19 +27,7 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 | --- | --- |
 | `F` | Start / stop farming |
 | `K` | Toggle the UI |
-| `Tab` | Switch tab (Farm / Drop / Move) |
-
-## Movement tab
-
-| Control | Default | What it does |
-| --- | --- | --- |
-| Movement type | Fast | Fast = walk speed boost, Normal = 100% |
-| Fast speed (max) | 200% | Upper bound the auto-tune may reach |
-| Speed check with teleport | Off | Steps forward with short teleports instead of running |
-| Noclip while travelling | On | Ignores collisions while moving, restores on stop |
-| Notify on snapback | On | Sends a notification when the server pulls you back |
-
-The speed percentage is auto-tuned at runtime: it climbs 5% every 15s while everything looks clean, and drops 10% when a snapback or a full block is detected. The footer shows live speed, snapbacks, anti-cheat lines and blocks.
+| `Tab` | Switch tab (Farm / Drop) |
 
 ## Usage
 
@@ -47,6 +36,10 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/ivyiz/ivyisbreakybrea
 ```
 
 The UI opens on load. Pick the zones/eggs, set a minimum CPS, choose the drop area, then press **Start** (or `F`).
+
+## Guard gate
+
+The script measures the distance to the nearest ZoneGuard before starting a steal or a new egg. The safe distance is half the current zone's length (clamped to 40–500 studs), so a guard standing around the middle of the zone is considered far enough. If a guard is closer, the script waits; after 30 s it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt.
 
 Run the reconnect companion the same way:
 
@@ -72,12 +65,9 @@ api.clearSelection()
 api.setMin(50e9)                    -- minimum pet CPS to keep
 api.setDropArea("safe")             -- "safe" | "zone1"
 api.setAutoGems(true)               -- walk onto gem drops
-api.setMoveType("fast")             -- "fast" | "normal"
-api.setSpeedPct(160)                -- current boost percentage
-api.setSpeedMax(200)                -- upper bound for auto-tune
-api.setNoclip(true)                 -- ignore collisions while travelling
-api.setNotifySnapback(true)         -- notify when the server pulls you back
-api.setTeleportCheck(false)         -- travel with short teleport steps
+api.setZoneStart(true)              -- eggs near the zone entrance first
+api.setGuardGate(true)              -- wait for guards to move away
+api.setGuardSafeDist(0)             -- 0 = auto (half the zone length)
 ```
 
 `getgenv().EggFarmerCleanup` tears down the UI and all connections; loading the script again calls it automatically.

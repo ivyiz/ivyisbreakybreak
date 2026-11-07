@@ -78,11 +78,9 @@ local CONFIG = {
     selected = {},
     dropArea = "zone1",
     autoGems = true,
-    moveType = "fast",
-    speedPct = 160,
-    speedMax = 200,    noclip = true,
-    notifySnapback = true,
-    teleportCheck = false,
+    zoneStart = true,
+    guardGate = true,
+    guardSafeDist = 0,
     roamRadius = 900,
     petScanRadius = 250,
     stepSeconds = 0.55,
@@ -141,7 +139,6 @@ local state = {
     orbits = 0,
     forcePushUntil = 0,
     pathGoal = nil,
-    noclipOn = false,
     debug = { steal = nil, carry = nil, jumps = 0 },
 }
 
@@ -179,197 +176,12 @@ end
 
 local TURN_RATE = 10
 
-local speed = {
-    base = 140,
-    applied = nil,
-    pct = 160,
-    measured = 0,
-    snapbacks = 0,
-    blocked = 0,
-    lines = 0,
-    lastSample = 0,
-    lastPos = nil,
-    still = 0,
-    lastTune = 0,
-    lastNotify = 0,
-}
-
-local noclipSaved = {}
-
-local function notify(text)
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "Egg Farmer",
-            Text = text,
-            Duration = 4,
-        })
-    end)
-end
-
-local function setNoclip(on)
-    local ch = LP.Character
-    if not ch then
-        return
-    end
-    if on then
-        for _, d in ipairs(ch:GetDescendants()) do
-            if d:IsA("BasePart") and d.CanCollide then
-                noclipSaved[d] = true
-                d.CanCollide = false
-            end
-        end
-    else
-        for part in pairs(noclipSaved) do
-            if part.Parent then
-                pcall(function()
-                    part.CanCollide = true
-                end)
-            end
-        end
-        table.clear(noclipSaved)
-    end
-end
-
-local function refreshBaseSpeed(hum)
-    local cur = hum.WalkSpeed
-    if cur <= 1 then
-        return
-    end
-    if not speed.applied or math.abs(cur - speed.applied) > 0.5 then
-        speed.base = cur
-    end
-end
-
-local function desiredSpeed(dist)
-    if CONFIG.moveType ~= "fast" then
-        return speed.base
-    end
-    local pct = speed.pct
-    if dist and dist < 60 then
-        local f = math.clamp((dist - 6) / 54, 0.16, 1)
-        pct = pct * f
-    end
-    return math.max(speed.base * pct / 100, 8)
-end
-
-local function restoreSpeed(hum)
-    if speed.applied and hum then
-        hum.WalkSpeed = speed.base
-    end
-    speed.applied = nil
-end
-
-local function sampleSpeed(active, target)
-    local r = root()
-    if not r then
-        return
-    end
-    local now = os.clock()
-    if not speed.lastPos then
-        speed.lastPos = r.Position
-        speed.lastSample = now
-        return
-    end
-    local dt = now - speed.lastSample
-    if dt < 0.25 then
-        return
-    end
-    local v = r.Position - speed.lastPos
-    local moved = Vector3.new(v.X, 0, v.Z).Magnitude
-    speed.lastPos = r.Position
-    speed.lastSample = now
-    local measured = moved / dt
-    speed.measured = measured
-    if not active or target < 100 then
-        speed.still = 0
-        return
-    end
-    local dir = state.moveDir
-    if dir then
-        local back = -(v.X * dir.X + v.Z * dir.Z)
-        if back > 8 then
-            speed.lines += 1
-            speed.snapbacks += 1
-            speed.pct = math.max(100, speed.pct - 10)
-            CONFIG.speedPct = math.floor(speed.pct)
-            speed.lastTune = now
-            speed.target = nil
-            speed.still = 0
-            if CONFIG.notifySnapback and now - speed.lastNotify > 5 then
-                speed.lastNotify = now
-                notify(string.format("Snapback - speed lowered to %d%%", math.floor(speed.pct)))
-            end
-            return
-        end
-    end
-    if moved > target * dt * 3 + 40 then
-        -- teleport / portal, not a real speed sample
-        speed.still = 0
-        speed.target = target
-        speed.targetAt = now
-        return
-    end
-    if math.abs(target - (speed.target or 0)) > 1 then
-        speed.target = target
-        speed.targetAt = now
-        speed.still = 0
-        return
-    end
-    if now - (speed.targetAt or 0) < 1.2 then
-        speed.still = 0
-        return
-    end
-    if measured < target * 0.35 then
-        speed.lines += 1
-        speed.still += 1
-        if measured < 2 then
-            speed.blocked += 1
-        end
-        if speed.still >= 2 and measured < 6 then
-            state.noclipFreezeUntil = now + 2
-        end
-        if speed.still >= 3 then
-            speed.still = 0
-            speed.snapbacks += 1
-            if CONFIG.moveType == "fast" then
-                speed.pct = math.max(100, speed.pct - 10)
-                CONFIG.speedPct = math.floor(speed.pct)
-            end
-            speed.lastTune = now
-            if CONFIG.notifySnapback and now - speed.lastNotify > 5 then
-                speed.lastNotify = now
-                notify(string.format("Snapback - speed lowered to %d%%", math.floor(speed.pct)))
-            end
-        end
-    else
-        speed.still = 0
-    end
-    if CONFIG.moveType == "fast" and now - speed.lastTune > 15 and speed.pct < CONFIG.speedMax then
-        speed.pct = math.min(CONFIG.speedMax, speed.pct + 5)
-        CONFIG.speedPct = math.floor(speed.pct)
-        speed.lastTune = now
-    end
-end
-
-local function setNoclipState(on)
-    if state.noclipOn == on then
-        return
-    end
-    state.noclipOn = on
-    setNoclip(on)
-end
-
 track(RunService.RenderStepped:Connect(function(dt)
-    local ch, hum = alive()
     if not state.moveTarget then
         state.moveDir = nil
-        if hum then
-            refreshBaseSpeed(hum)
-            restoreSpeed(hum)
-        end
-        setNoclipState(false)
         return
     end
+    local ch, hum = alive()
     local r = root()
     if not ch or not hum or not r then
         return
@@ -380,26 +192,11 @@ track(RunService.RenderStepped:Connect(function(dt)
     if dist < (state.stopRadius or 0.8) then
         state.moveDir = nil
         hum:Move(Vector3.zero)
-        refreshBaseSpeed(hum)
-        restoreSpeed(hum)
-        setNoclipState(false)
-        sampleSpeed(false, 0)
         return
     end
     local desired = delta.Unit
     if state.nudge and os.clock() < state.nudge.until_ then
         desired = (desired + state.nudge.dir * 1.6).Unit
-    end
-    if CONFIG.teleportCheck and CONFIG.moveType == "fast"
-        and LP:GetAttribute("Carrying") == nil and dist > 70
-        and os.clock() - (state.tpAt or 0) > 0.35 then
-        state.tpAt = os.clock()
-        local step = math.min(18, dist - 40)
-        if step > 2 then
-            local p = r.Position + desired * step
-            r.CFrame = CFrame.new(p.X, p.Y + 1, p.Z)
-            r.AssemblyLinearVelocity = Vector3.zero
-        end
     end
     local current = state.moveDir
     if current and dist > 4 and os.clock() >= state.forcePushUntil then
@@ -410,12 +207,7 @@ track(RunService.RenderStepped:Connect(function(dt)
     else
         state.moveDir = desired
     end
-    setNoclipState(CONFIG.noclip == true and os.clock() >= (state.noclipFreezeUntil or 0))
-    refreshBaseSpeed(hum)
-    hum.WalkSpeed = desiredSpeed(dist)
-    speed.applied = hum.WalkSpeed
     hum:Move(state.moveDir)
-    sampleSpeed(true, hum.WalkSpeed)
     local stall = state.stall
     if not stall or (stall.pos - r.Position).Magnitude > 2 then
         state.stall = { pos = r.Position, at = os.clock() }
@@ -442,9 +234,7 @@ local function stopMove()
     local _, hum = alive()
     if hum then
         hum:Move(Vector3.zero)
-        restoreSpeed(hum)
     end
-    setNoclipState(false)
 end
 
 local function cleanup()
@@ -653,14 +443,105 @@ local function zoneName()
     return z
 end
 
-local function zoneAnchor(z)
+local function zoneHitbox(z)
     local build = Workspace:FindFirstChild("Build")
     local hb = build and build:FindFirstChild("ZoneHitboxes")
     local part = hb and hb:FindFirstChild(tostring(z))
     if part and part:IsA("BasePart") then
+        return part
+    end
+    return nil
+end
+
+local function zoneAnchor(z)
+    local part = zoneHitbox(z)
+    if part then
         return Vector3.new(part.Position.X + 20, 4, part.Position.Z)
     end
     return Vector3.new(-106, 4, -1)
+end
+
+local function zoneStartX(z)
+    local part = zoneHitbox(z)
+    if not part then
+        return nil
+    end
+    return part.Position.X + part.Size.X / 2
+end
+
+local function zoneSafeDist(zoneIndex)
+    if CONFIG.guardSafeDist and CONFIG.guardSafeDist > 0 then
+        return CONFIG.guardSafeDist
+    end
+    local part = zoneHitbox(zoneIndex)
+    if not part then
+        return 150
+    end
+    return math.clamp(part.Size.X / 2, 40, 500)
+end
+
+local function guardSafeDistFor()
+    local z = tonumber(string.match(zoneName(), "%d+")) or 1
+    return zoneSafeDist(z)
+end
+
+local function nearestGuard()
+    local r = root()
+    if not r then
+        return nil, math.huge
+    end
+    local best, bestD = nil, math.huge
+    for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
+        local ok, pivot = pcall(function()
+            return g:GetPivot().Position
+        end)
+        if ok and pivot then
+            local d = (pivot - r.Position).Magnitude
+            if d < bestD then
+                best, bestD = g, d
+            end
+        end
+    end
+    return best, bestD
+end
+
+local guardWait = { since = 0, retreatUntil = 0 }
+
+local function guardAllows()
+    if not CONFIG.guardGate then
+        return true
+    end
+    local _, d = nearestGuard()
+    state.guardDist = d
+    local need = guardSafeDistFor()
+    local now = os.clock()
+    if d >= need then
+        guardWait.since = 0
+        return true
+    end
+    if guardWait.since == 0 then
+        guardWait.since = now
+    end
+    if now - guardWait.since > 90 then
+        guardWait.since = now
+        return true
+    end
+    if now - guardWait.since > 30 then
+        local r = root()
+        local z = tonumber(string.match(zoneName(), "%d+")) or 1
+        local startX = zoneStartX(z)
+        if r and startX and now >= guardWait.retreatUntil then
+            guardWait.retreatUntil = now + 4
+            state.pathGoal = Vector3.new(startX - 15, r.Position.Y, r.Position.Z)
+            state.stopRadius = 4
+            state.moveTarget = state.pathGoal
+        end
+    else
+        stopMove()
+    end
+    setStatus(string.format("Waiting for guard (%dm < %dm)", math.floor(d), math.floor(need)))
+    task.wait(0.3)
+    return false
 end
 
 local function dropZoneName()
@@ -718,19 +599,43 @@ local function carriedModel()
     return nil
 end
 
+local function eggDepth(egg)
+    local zone = egg:GetAttribute("ZoneIndex")
+    local startX = zoneStartX(zone)
+    if not startX then
+        return math.huge
+    end
+    return startX - egg.Position.X
+end
+
 local function nearestEgg()
     local r = root()
     if not r then
         return nil, math.huge
     end
-    local best, bestD, bestZone
+    local best, bestD, bestZone, bestDepth
     for _, egg in ipairs(CS:GetTagged("BreakableEgg")) do
         if egg:IsA("BasePart") and egg.Parent and EggTargeting.IsLive(egg) then
             if (blacklist[egg] or 0) < os.clock() and allowed(egg) then
                 local zone = egg:GetAttribute("ZoneIndex")
                 local d = EggTargeting.SurfaceDistance(egg, r.Position)
-                if not bestZone or zone > bestZone or (zone == bestZone and d < bestD) then
-                    best, bestD, bestZone = egg, d, zone
+                local depth = CONFIG.zoneStart and eggDepth(egg) or nil
+                local better = false
+                if not bestZone or zone > bestZone then
+                    better = true
+                elseif zone == bestZone then
+                    if depth and bestDepth then
+                        if depth < bestDepth - 0.01 then
+                            better = true
+                        elseif math.abs(depth - bestDepth) <= 0.01 and d < bestD then
+                            better = true
+                        end
+                    elseif d < bestD then
+                        better = true
+                    end
+                end
+                if better then
+                    best, bestD, bestZone, bestDepth = egg, d, zone, depth
                 end
             end
         end
@@ -1238,6 +1143,9 @@ local function farmStep(runId)
 
     local pet = findWantedPet()
     if pet then
+        if not guardAllows() then
+            return
+        end
         state.pendingCps = petCps(pet)
         state.carrySnapshot = { name = pet:GetAttribute("AnimalName"), cps = state.pendingCps }
         state.debug.steal = {
@@ -1260,6 +1168,9 @@ local function farmStep(runId)
     local egg = state.targetEgg
     if not egg or not egg.Parent or not EggTargeting.IsLive(egg) or not allowed(egg) then
         egg = nil
+        if not guardAllows() then
+            return
+        end
         if state.targetEgg then
             blacklist[state.targetEgg] = os.clock() + 30
             task.wait(0.12)
@@ -1267,6 +1178,7 @@ local function farmStep(runId)
         state.targetEgg = nearestEgg()
         egg = state.targetEgg
         if egg then
+            state.targetDepth = eggDepth(egg)
             state.targetAt = os.clock()
             state.targetHp = egg:GetAttribute("Health")
             state.lastHpChange = os.clock()
@@ -1425,23 +1337,14 @@ local function loadConfig()
         if type(data.autoGems) == "boolean" then
             CONFIG.autoGems = data.autoGems
         end
-        if data.moveType == "fast" or data.moveType == "normal" then
-            CONFIG.moveType = data.moveType
+        if type(data.zoneStart) == "boolean" then
+            CONFIG.zoneStart = data.zoneStart
         end
-        if type(data.speedPct) == "number" then
-            CONFIG.speedPct = math.clamp(data.speedPct, 100, 200)
+        if type(data.guardGate) == "boolean" then
+            CONFIG.guardGate = data.guardGate
         end
-        if type(data.speedMax) == "number" then
-            CONFIG.speedMax = math.clamp(data.speedMax, 100, 300)
-        end
-        if type(data.noclip) == "boolean" then
-            CONFIG.noclip = data.noclip
-        end
-        if type(data.notifySnapback) == "boolean" then
-            CONFIG.notifySnapback = data.notifySnapback
-        end
-        if type(data.teleportCheck) == "boolean" then
-            CONFIG.teleportCheck = data.teleportCheck
+        if type(data.guardSafeDist) == "number" then
+            CONFIG.guardSafeDist = math.max(0, data.guardSafeDist)
         end
         if data.version == CONFIG_VERSION and type(data.selected) == "table" then
             for _, name in ipairs(data.selected) do
@@ -1470,12 +1373,9 @@ function saveConfig()
             minCps = CONFIG.minCps,
             dropArea = CONFIG.dropArea,
             autoGems = CONFIG.autoGems,
-            moveType = CONFIG.moveType,
-            speedPct = math.floor(speed.pct),
-            speedMax = CONFIG.speedMax,
-            noclip = CONFIG.noclip,
-            notifySnapback = CONFIG.notifySnapback,
-            teleportCheck = CONFIG.teleportCheck,
+            zoneStart = CONFIG.zoneStart,
+            guardGate = CONFIG.guardGate,
+            guardSafeDist = CONFIG.guardSafeDist,
             selected = list,
         }))
     end)
@@ -1662,7 +1562,6 @@ local function buildUI()
     end
     local farmTabButton, farmUnderline = makeTabButton("Farm", 0)
     local dropTabButton, dropUnderline = makeTabButton("Drop", 84)
-    local moveTabButton, moveUnderline = makeTabButton("Move", 168)
 
     local content = Instance.new("Frame")
     content.Size = UDim2.new(1, 0, 0, 0)
@@ -1698,31 +1597,16 @@ local function buildUI()
     dropList.SortOrder = Enum.SortOrder.LayoutOrder
     dropList.Parent = dropTab
 
-    local moveTab = Instance.new("Frame")
-    moveTab.Size = UDim2.new(1, 0, 0, 0)
-    moveTab.AutomaticSize = Enum.AutomaticSize.Y
-    moveTab.BackgroundTransparency = 1
-    moveTab.Visible = false
-    moveTab.LayoutOrder = 3
-    moveTab.Parent = content
-    local moveList = Instance.new("UIListLayout")
-    moveList.Padding = UDim.new(0, 12)
-    moveList.SortOrder = Enum.SortOrder.LayoutOrder
-    moveList.Parent = moveTab
-
     local closeAllDropdowns
     local activeTab = "farm"
     local function setTab(name)
         activeTab = name
         farmTab.Visible = name == "farm"
         dropTab.Visible = name == "drop"
-        moveTab.Visible = name == "move"
         farmTabButton.TextColor3 = name == "farm" and COLORS.text or COLORS.muted
         dropTabButton.TextColor3 = name == "drop" and COLORS.text or COLORS.muted
-        moveTabButton.TextColor3 = name == "move" and COLORS.text or COLORS.muted
         farmUnderline.Visible = name == "farm"
         dropUnderline.Visible = name == "drop"
-        moveUnderline.Visible = name == "move"
         if closeAllDropdowns then
             closeAllDropdowns()
         end
@@ -1732,9 +1616,6 @@ local function buildUI()
     end)
     dropTabButton.MouseButton1Click:Connect(function()
         setTab("drop")
-    end)
-    moveTabButton.MouseButton1Click:Connect(function()
-        setTab("move")
     end)
 
     local minRow = Instance.new("Frame")
@@ -1828,111 +1709,30 @@ local function buildUI()
     dropHelp.TextWrapped = true
     dropHelp.LayoutOrder = 2
 
-    local moveTypeRow = Instance.new("Frame")
-    moveTypeRow.Size = UDim2.new(1, 0, 0, 38)
-    moveTypeRow.BackgroundTransparency = 1
-    moveTypeRow.LayoutOrder = 1
-    moveTypeRow.Parent = moveTab
+    local zoneRow = Instance.new("Frame")
+    zoneRow.Size = UDim2.new(1, 0, 0, 34)
+    zoneRow.BackgroundTransparency = 1
+    zoneRow.LayoutOrder = 4
+    zoneRow.Parent = farmTab
 
-    local moveTypeLabel = text(moveTypeRow, "Movement type", 14, COLORS.muted)
-    moveTypeLabel.Size = UDim2.new(1, -120, 1, 0)
+    local zoneLabel = text(zoneRow, "Start-zone eggs first", 14, COLORS.muted)
+    zoneLabel.Size = UDim2.new(1, -80, 1, 0)
 
-    local moveTypeButton = makeButton(moveTypeRow, CONFIG.moveType == "fast" and "Fast" or "Normal", false, 34)
-    moveTypeButton.Size = UDim2.fromOffset(110, 34)
-    moveTypeButton.AnchorPoint = Vector2.new(1, 0.5)
-    moveTypeButton.Position = UDim2.new(1, 0, 0.5, 0)
-    moveTypeButton.TextSize = 14
-
-    local speedRow = Instance.new("Frame")
-    speedRow.Size = UDim2.new(1, 0, 0, 38)
-    speedRow.BackgroundTransparency = 1
-    speedRow.LayoutOrder = 2
-    speedRow.Parent = moveTab
-
-    local speedRowLabel = text(speedRow, "Fast speed (max)", 14, COLORS.muted)
-    speedRowLabel.Size = UDim2.new(1, -100, 1, 0)
-
-    local speedBox = Instance.new("TextBox")
-    speedBox.Size = UDim2.fromOffset(84, 34)
-    speedBox.AnchorPoint = Vector2.new(1, 0.5)
-    speedBox.Position = UDim2.new(1, 0, 0.5, 0)
-    speedBox.BackgroundColor3 = COLORS.surface
-    speedBox.BorderSizePixel = 0
-    speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
-    speedBox.PlaceholderText = "200%"
-    speedBox.TextColor3 = COLORS.text
-    speedBox.PlaceholderColor3 = COLORS.muted
-    speedBox.TextSize = 14
-    speedBox.Font = Enum.Font.Roboto
-    if FACE_REGULAR then
-        speedBox.FontFace = FACE_REGULAR
-    end
-    speedBox.TextXAlignment = Enum.TextXAlignment.Center
-    speedBox.ClearTextOnFocus = false
-    speedBox.Parent = speedRow
-    corner(speedBox, 6)
-    stroke(speedBox, COLORS.border)
-
-    local tpRow = Instance.new("Frame")
-    tpRow.Size = UDim2.new(1, 0, 0, 34)
-    tpRow.BackgroundTransparency = 1
-    tpRow.LayoutOrder = 3
-    tpRow.Parent = moveTab
-
-    local tpLabel = text(tpRow, "Speed check with teleport", 14, COLORS.muted)
-    tpLabel.Size = UDim2.new(1, -80, 1, 0)
-
-    local tpToggle = makeButton(tpRow, CONFIG.teleportCheck and "On" or "Off", false, 30)
-    tpToggle.Size = UDim2.fromOffset(70, 30)
-    tpToggle.AnchorPoint = Vector2.new(1, 0.5)
-    tpToggle.Position = UDim2.new(1, 0, 0.5, 0)
-    tpToggle.TextSize = 13
-
-    local noclipRow = Instance.new("Frame")
-    noclipRow.Size = UDim2.new(1, 0, 0, 34)
-    noclipRow.BackgroundTransparency = 1
-    noclipRow.LayoutOrder = 4
-    noclipRow.Parent = moveTab
-
-    local noclipLabel = text(noclipRow, "Noclip while travelling", 14, COLORS.muted)
-    noclipLabel.Size = UDim2.new(1, -80, 1, 0)
-
-    local noclipToggle = makeButton(noclipRow, CONFIG.noclip and "On" or "Off", false, 30)
-    noclipToggle.Size = UDim2.fromOffset(70, 30)
-    noclipToggle.AnchorPoint = Vector2.new(1, 0.5)
-    noclipToggle.Position = UDim2.new(1, 0, 0.5, 0)
-    noclipToggle.TextSize = 13
-
-    local notifyRow = Instance.new("Frame")
-    notifyRow.Size = UDim2.new(1, 0, 0, 34)
-    notifyRow.BackgroundTransparency = 1
-    notifyRow.LayoutOrder = 5
-    notifyRow.Parent = moveTab
-
-    local notifyLabel = text(notifyRow, "Notify on snapback", 14, COLORS.muted)
-    notifyLabel.Size = UDim2.new(1, -80, 1, 0)
-
-    local notifyToggle = makeButton(notifyRow, CONFIG.notifySnapback and "On" or "Off", false, 30)
-    notifyToggle.Size = UDim2.fromOffset(70, 30)
-    notifyToggle.AnchorPoint = Vector2.new(1, 0.5)
-    notifyToggle.Position = UDim2.new(1, 0, 0.5, 0)
-    notifyToggle.TextSize = 13
-
-    local moveStats = text(moveTab, "Speed now 0 studs/s", 12, COLORS.muted)
-    moveStats.Size = UDim2.new(1, 0, 0, 0)
-    moveStats.AutomaticSize = Enum.AutomaticSize.Y
-    moveStats.TextWrapped = true
-    moveStats.LayoutOrder = 6
+    local zoneToggle = makeButton(zoneRow, CONFIG.zoneStart and "On" or "Off", false, 30)
+    zoneToggle.Size = UDim2.fromOffset(70, 30)
+    zoneToggle.AnchorPoint = Vector2.new(1, 0.5)
+    zoneToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    zoneToggle.TextSize = 13
 
     local errorLabel = text(farmTab, "", 13, COLORS.text)
     errorLabel.Size = UDim2.new(1, 0, 0, 0)
     errorLabel.AutomaticSize = Enum.AutomaticSize.Y
     errorLabel.TextWrapped = true
     errorLabel.Visible = false
-    errorLabel.LayoutOrder = 6
+    errorLabel.LayoutOrder = 5
 
     local toggleButton = makeButton(farmTab, "Start", true, 44)
-    toggleButton.LayoutOrder = 7
+    toggleButton.LayoutOrder = 6
     toggleButton.TextSize = 16
     local toggleStroke = stroke(toggleButton, COLORS.text)
     toggleStroke.Transparency = 1
@@ -2399,8 +2199,6 @@ local function buildUI()
         gemToggle:SetAttribute("pressColor", gemPress)
         gemToggle.BackgroundColor3 = gemBase
         gemToggle.TextColor3 = CONFIG.autoGems and COLORS.accentText or COLORS.text
-        moveTypeButton.Text = CONFIG.moveType == "fast" and "Fast" or "Normal"
-        speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
         local function styleToggle(button, on)
             local b = on and COLORS.accent or COLORS.surface
             local h = on and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
@@ -2412,9 +2210,7 @@ local function buildUI()
             button.TextColor3 = on and COLORS.accentText or COLORS.text
             button.Text = on and "On" or "Off"
         end
-        styleToggle(tpToggle, CONFIG.teleportCheck)
-        styleToggle(noclipToggle, CONFIG.noclip)
-        styleToggle(notifyToggle, CONFIG.notifySnapback)
+        styleToggle(zoneToggle, CONFIG.zoneStart)
         dropButton.Text = dropLabel()
         refreshDropOptions()
         ui.refreshEggButton()
@@ -2461,29 +2257,8 @@ local function buildUI()
         api.setAutoGems(not CONFIG.autoGems)
     end)
 
-    moveTypeButton.MouseButton1Click:Connect(function()
-        api.setMoveType(CONFIG.moveType == "fast" and "normal" or "fast")
-    end)
-
-    speedBox.FocusLost:Connect(function()
-        local n = tonumber((string.gsub(speedBox.Text, "[^%d]", "")))
-        if n then
-            api.setSpeedMax(n)
-        else
-            speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
-        end
-    end)
-
-    tpToggle.MouseButton1Click:Connect(function()
-        api.setTeleportCheck(not CONFIG.teleportCheck)
-    end)
-
-    noclipToggle.MouseButton1Click:Connect(function()
-        api.setNoclip(not CONFIG.noclip)
-    end)
-
-    notifyToggle.MouseButton1Click:Connect(function()
-        api.setNotifySnapback(not CONFIG.notifySnapback)
+    zoneToggle.MouseButton1Click:Connect(function()
+        api.setZoneStart(not CONFIG.zoneStart)
     end)
 
     toggleButton.MouseButton1Click:Connect(function()
@@ -2507,29 +2282,9 @@ local function buildUI()
         elseif input.KeyCode == Enum.KeyCode.K then
             api.toggle()
         elseif input.KeyCode == Enum.KeyCode.Tab and screen.Enabled then
-            if activeTab == "farm" then
-                setTab("drop")
-            elseif activeTab == "drop" then
-                setTab("move")
-            else
-                setTab("farm")
-            end
+            setTab(activeTab == "farm" and "drop" or "farm")
         end
     end))
-
-    task.spawn(function()
-        while screen.Parent do
-            moveStats.Text = string.format(
-                "Speed now %d studs/s · Fast boost %d%%\nSnapbacks %d · anti-cheat lines %d · blocked %d",
-                math.floor(speed.measured),
-                math.floor(speed.pct),
-                speed.snapbacks,
-                speed.lines,
-                speed.blocked
-            )
-            task.wait(0.5)
-        end
-    end)
 
     ui.refresh()
     return screen
@@ -2561,55 +2316,24 @@ function api.setAutoGems(value)
     end
 end
 
-function api.setMoveType(value)
-    CONFIG.moveType = value == "normal" and "normal" or "fast"
+function api.setZoneStart(value)
+    CONFIG.zoneStart = value == true
     saveConfig()
     if ui then
         ui.refresh()
     end
 end
 
-function api.setSpeedPct(value)
-    speed.pct = math.clamp(value or 160, 100, CONFIG.speedMax)
-    CONFIG.speedPct = math.floor(speed.pct)
+function api.setGuardGate(value)
+    CONFIG.guardGate = value == true
     saveConfig()
     if ui then
         ui.refresh()
     end
 end
 
-function api.setSpeedMax(value)
-    CONFIG.speedMax = math.clamp(value or 200, 100, 300)
-    if speed.pct > CONFIG.speedMax then
-        speed.pct = CONFIG.speedMax
-    end
-    saveConfig()
-    if ui then
-        ui.refresh()
-    end
-end
-
-function api.setNoclip(value)
-    CONFIG.noclip = value == true
-    if not CONFIG.noclip then
-        setNoclipState(false)
-    end
-    saveConfig()
-    if ui then
-        ui.refresh()
-    end
-end
-
-function api.setNotifySnapback(value)
-    CONFIG.notifySnapback = value == true
-    saveConfig()
-    if ui then
-        ui.refresh()
-    end
-end
-
-function api.setTeleportCheck(value)
-    CONFIG.teleportCheck = value == true
+function api.setGuardSafeDist(value)
+    CONFIG.guardSafeDist = math.max(0, tonumber(value) or 0)
     saveConfig()
     if ui then
         ui.refresh()
@@ -2739,20 +2463,15 @@ function api.getState()
         dropZone = dropZoneName(),
         dropArea = CONFIG.dropArea,
         autoGems = CONFIG.autoGems,
-        moveType = CONFIG.moveType,
-        speedPct = math.floor(speed.pct),
-        speedMax = CONFIG.speedMax,
-        speedNow = math.floor(speed.measured),
-        snapbacks = speed.snapbacks,
-        antiCheatLines = speed.lines,
-        blocked = speed.blocked,
-        noclip = CONFIG.noclip,
-        notifySnapback = CONFIG.notifySnapback,
-        teleportCheck = CONFIG.teleportCheck,
+        zoneStart = CONFIG.zoneStart,
+        guardGate = CONFIG.guardGate,
+        guardSafeDist = guardSafeDistFor(),
         recovering = state.recover ~= nil,
         recoverName = state.recover and state.recover.name or nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
         targetHp = state.targetEgg and state.targetEgg:GetAttribute("Health") or nil,
+        targetDepth = state.targetDepth,
+        guardDist = state.guardDist,
         swings = state.swingCount,
         orbits = state.orbits,
         carrying = tostring(LP:GetAttribute("Carrying")),
@@ -2763,13 +2482,6 @@ function api.getState()
 end
 
 loadConfig()
-speed.pct = CONFIG.speedPct
-do
-    local _, hum = alive()
-    if hum then
-        speed.base = hum.WalkSpeed
-    end
-end
 buildUI()
 getgenv().EggFarmer = api
 getgenv().EggFarmerUI = ui
