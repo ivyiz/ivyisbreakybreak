@@ -15,7 +15,6 @@ local CS = game:GetService("CollectionService")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
-local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 
 local LP = Players.LocalPlayer
@@ -27,7 +26,6 @@ local ZoneLookup = require(Shared.ZoneHitboxLookup)
 local DropCarriedRemote = RS:WaitForChild("DropCarriedRemote")
 local ClientFolder = LP.PlayerScripts:WaitForChild("Client")
 local Controllers = ClientFolder:WaitForChild("Controllers")
-local PickaxeConfig = require(Shared.PickaxeConfig)
 local AutoSwing = require(Controllers:WaitForChild("AutoSwingController"))
 local PickaxeController = require(Controllers:WaitForChild("PickaxeController"))
 local firePrompt = fireproximityprompt
@@ -80,9 +78,7 @@ local CONFIG = {
     autoGems = true,
     smartFarm = true,
     guardSafeDist = 0,
-    roamRadius = 900,
     petScanRadius = 250,
-    stepSeconds = 0.55,
 }
 
 local RECOVER_SECONDS = 15
@@ -125,7 +121,6 @@ local state = {
     skipped = 0,
     lastDrop = "-",
     targetEgg = nil,
-    targetAt = 0,
     targetHp = nil,
     returnPos = nil,
     pendingCps = nil,
@@ -133,6 +128,7 @@ local state = {
     moveDir = nil,
     stopRadius = nil,
     intentionalDrop = false,
+    dropGraceUntil = 0,
     carrySnapshot = nil,
     recover = nil,
     gemJob = nil,
@@ -232,7 +228,6 @@ local function stopMove()
     state.moveTarget = nil
     state.moveDir = nil
     state.stopRadius = nil
-    state.moveToAt = nil
     local _, hum = alive()
     if hum then
         hum:Move(Vector3.zero)
@@ -289,7 +284,7 @@ track(LP:GetAttributeChangedSignal("Carrying"):Connect(function()
     if LP:GetAttribute("Carrying") ~= nil then
         return
     end
-    if state.intentionalDrop then
+    if state.intentionalDrop or os.clock() < (state.dropGraceUntil or 0) then
         return
     end
     local snapshot = state.carrySnapshot
@@ -974,7 +969,7 @@ local function recoverStep()
                 local reserved = m:GetAttribute("ReservedUserId")
                 if reserved ~= nil and reserved ~= LP.UserId then
                     takenByOther = true
-                else
+                elseif not inDroppedZone(m:GetPivot().Position) then
                     local cps = petCps(m)
                     if cps and cps >= CONFIG.minCps then
                         local ok, pivot = pcall(function()
@@ -1049,6 +1044,7 @@ end
 
 local function dropCarried()
     state.intentionalDrop = true
+    state.dropGraceUntil = os.clock() + 0.6
     for _ = 1, 3 do
         if LP:GetAttribute("Carrying") == nil then
             state.intentionalDrop = false
@@ -1076,7 +1072,7 @@ local updateStats
 local function handleCarried()
     local model = carriedModel()
     local modelCps = model and petCps(model) or nil
-    local cps = modelCps or state.pendingCps
+    local cps = state.pendingCps or modelCps
     local r = root()
     if not r or LP:GetAttribute("Carrying") == nil then
         return
@@ -1304,6 +1300,7 @@ local function farmStep(runId)
         else
             ignored[pet] = os.clock() + 60
             state.pendingCps = nil
+            state.carrySnapshot = nil
             setStatus("Pet steal failed - skipping")
         end
         return
@@ -1324,13 +1321,10 @@ local function farmStep(runId)
         egg = state.targetEgg
         if egg then
             state.targetDepth = eggDepth(egg)
-            state.targetAt = os.clock()
             state.targetHp = egg:GetAttribute("Health")
             state.lastHpChange = os.clock()
             state.stallRepos = 0
-            state.lastSwing = 0
             state.forceApproachUntil = nil
-            state.moveAt = 0
         end
     end
 
@@ -2552,6 +2546,9 @@ function api.start()
     state.approach = nil
     state.pathGoal = nil
     state.recover = nil
+    state.carrySnapshot = nil
+    state.pendingCps = nil
+    state.forcePushUntil = 0
     updateStats()
     if ui then
         ui.refresh()
@@ -2574,13 +2571,14 @@ function api.stop()
     state.running = false
     state.runId += 1
     state.targetEgg = nil
-    state.lastSwing = nil
     state.forceApproachUntil = nil
     state.gemJob = nil
     state.approach = nil
     state.forcePushUntil = 0
     state.pathGoal = nil
     state.recover = nil
+    state.carrySnapshot = nil
+    state.pendingCps = nil
     stopMove()
     setStatus("Stopped")
     pcall(function()
