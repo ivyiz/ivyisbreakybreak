@@ -39,7 +39,7 @@ The UI opens on load. Pick the zones/eggs, set a minimum CPS, choose the drop ar
 
 ## Guard gate
 
-The script measures the distance to the **guard of the zone being farmed** (other zones' guards are ignored) before starting a steal or a new egg. The safe distance is half that zone's length (clamped to 40–500 studs), so a guard standing around the middle of the zone is considered far enough. If the guard is closer, the script waits; after 30 s it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt. A guard that is actively chasing you is always treated as unsafe.
+Before stealing a pet or starting a new egg, the script measures the distance to the **guard of the zone being farmed** (other zones' guards are ignored). The guard must be at least **120 studs** away; while it is closer the script waits, and it will also wait if that guard is actively chasing you. After 30 s of waiting it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt. Change the threshold with `api.setGuardSafeDist(studs)` (0 = default 120).
 
 Run the reconnect companion the same way:
 
@@ -67,7 +67,7 @@ api.setDropArea("safe")             -- "safe" | "zone1"
 api.setAutoGems(true)               -- walk onto gem drops
 api.setZoneStart(true)              -- eggs near the zone entrance first
 api.setGuardGate(true)              -- wait for guards to move away
-api.setGuardSafeDist(0)             -- 0 = auto (half the zone length)
+api.setGuardSafeDist(0)             -- 0 = default 120 studs
 ```
 
 `getgenv().EggFarmerCleanup` tears down the UI and all connections; loading the script again calls it automatically.

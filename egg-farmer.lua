@@ -476,15 +476,13 @@ local function zoneIndexFromId(zoneId)
     return tonumber(string.match(zoneId, "%d+"))
 end
 
+local GUARD_SAFE_DEFAULT = 120
+
 local function zoneSafeDist(zoneIndex)
     if CONFIG.guardSafeDist and CONFIG.guardSafeDist > 0 then
         return CONFIG.guardSafeDist
     end
-    local part = zoneHitbox(zoneIndex)
-    if not part then
-        return 150
-    end
-    return math.clamp(part.Size.X / 2, 40, 500)
+    return GUARD_SAFE_DEFAULT
 end
 
 local function guardZoneId()
@@ -527,11 +525,17 @@ local function guardDistanceFor(zoneId)
 end
 
 local function guardChasingMe()
+    local r = root()
+    if not r then
+        return false
+    end
     for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
         local st = g:GetAttribute("ChaseState")
-        if st == "Chasing" or st == "WindUp" then
-            local owner = g:GetAttribute("CaughtUserId")
-            if owner == nil or owner == LP.UserId then
+        if (st == "Chasing" or st == "WindUp") and g:GetAttribute("CaughtUserId") == LP.UserId then
+            local ok, pivot = pcall(function()
+                return g:GetPivot().Position
+            end)
+            if ok and pivot and (pivot - r.Position).Magnitude < 150 then
                 return true
             end
         end
@@ -576,7 +580,11 @@ local function guardAllows(zoneId)
     else
         stopMove()
     end
-    setStatus(string.format("Waiting for guard %s (%dm < %dm)", zoneId:gsub("Zone", "Z"), math.floor(d), math.floor(need)))
+    if guardChasingMe() then
+        setStatus("Guard chasing - waiting")
+    else
+        setStatus(string.format("Waiting for guard %s (%dm < %dm)", zoneId:gsub("Zone", "Z"), math.floor(d), math.floor(need)))
+    end
     task.wait(0.3)
     return false
 end
