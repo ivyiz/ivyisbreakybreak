@@ -131,7 +131,6 @@ local state = {
     stopRadius = nil,
     intentionalDrop = false,
     carrySnapshot = nil,
-    recover = nil,
     gemJob = nil,
     swingCount = 0,
     approach = nil,
@@ -293,15 +292,20 @@ track(LP:GetAttributeChangedSignal("Carrying"):Connect(function()
     if not snapshot or not snapshot.name then
         return
     end
-    local r = root()
-    state.recover = {
-        name = snapshot.name,
-        cps = snapshot.cps,
-        pos = r and r.Position or Vector3.zero,
-        deadline = os.clock() + 60,
-    }
     state.carrySnapshot = nil
-    setStatus(string.format("Pet %s dropped - recovering...", snapshot.name))
+    state.pendingCps = nil
+    local r = root()
+    if r then
+        for _, m in ipairs(CS:GetTagged("AnimalPickup")) do
+            local ok, pivot = pcall(function()
+                return m:GetPivot().Position
+            end)
+            if ok and pivot and (pivot - r.Position).Magnitude <= 25 then
+                ignored[m] = os.clock() + 20
+            end
+        end
+    end
+    setStatus(string.format("Pet %s lost - continuing", snapshot.name))
 end))
 
 local function fmt(n)
@@ -1062,61 +1066,6 @@ local function farmStep(runId)
         return
     end
 
-
-    if state.recover then
-        if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
-            setStatus("Chased - delaying pet recovery")
-            state.pathGoal = dropAnchor()
-            state.moveTarget = state.pathGoal
-            task.wait(0.2)
-            return
-        end
-        if os.clock() > state.recover.deadline then
-            setStatus(string.format("Pet %s lost", state.recover.name))
-            state.recover = nil
-            return
-        end
-        local rr = root()
-        if not rr then
-            task.wait(0.2)
-            return
-        end
-        local found, bestD = nil, math.huge
-        for _, m in ipairs(CS:GetTagged("AnimalPickup")) do
-            if m:IsA("Model") and m.Parent and not m:GetAttribute("Despawning") then
-                if m:GetAttribute("AnimalName") == state.recover.name then
-                    local reserved = m:GetAttribute("ReservedUserId")
-                    if reserved == nil or reserved == LP.UserId then
-                        local d = (m:GetPivot().Position - rr.Position).Magnitude
-                        if d < bestD then
-                            found, bestD = m, d
-                        end
-                    end
-                end
-            end
-        end
-        if found and bestD < 160 then
-            setStatus(string.format("Recovering pet %s (%dm)", state.recover.name, math.floor(bestD)))
-            if steal(found) then
-                state.pendingCps = state.recover.cps
-                state.carrySnapshot = { name = found.Name, cps = state.recover.cps }
-                state.recover = nil
-                setStatus(string.format("Pet %s recovered", found.Name))
-            end
-            return
-        end
-        local dist = (rr.Position - state.recover.pos).Magnitude
-        if dist > 20 then
-            setStatus("Returning for dropped pet...")
-            state.pathGoal = state.recover.pos
-            state.moveTarget = state.recover.pos
-            task.wait(0.2)
-            return
-        end
-        setStatus(string.format("Searching for pet %s...", state.recover.name))
-        task.wait(0.5)
-        return
-    end
 
     if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
         setStatus("Chased - running...")
@@ -2518,8 +2467,8 @@ function api.getState()
         guardGate = CONFIG.smartFarm,
         guardZone = state.guardZone,
         guardSafeDist = guardSafeDistFor(),
-        recovering = state.recover ~= nil,
-        recoverName = state.recover and state.recover.name or nil,
+        recovering = false,
+        recoverName = nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
         targetHp = state.targetEgg and state.targetEgg:GetAttribute("Health") or nil,
         targetDepth = state.targetDepth,
