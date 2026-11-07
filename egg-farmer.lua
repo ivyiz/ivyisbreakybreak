@@ -17,7 +17,6 @@ local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LP = Players.LocalPlayer
 local Shared = RS:WaitForChild("Shared")
@@ -31,11 +30,6 @@ local Controllers = ClientFolder:WaitForChild("Controllers")
 local PickaxeConfig = require(Shared.PickaxeConfig)
 local AutoSwing = require(Controllers:WaitForChild("AutoSwingController"))
 local PickaxeController = require(Controllers:WaitForChild("PickaxeController"))
-local RideRemote = RS:FindFirstChild("RideRemote")
-local RideConfig
-pcall(function()
-    RideConfig = require(Shared.RideConfig)
-end)
 local firePrompt = fireproximityprompt
 
 local function disconnectOldSource(signal)
@@ -84,8 +78,11 @@ local CONFIG = {
     selected = {},
     dropArea = "zone1",
     autoGems = true,
-    evade = true,
-    autoMount = true,
+    moveType = "fast",
+    speedPct = 160,
+    speedMax = 200,    noclip = true,
+    notifySnapback = true,
+    teleportCheck = false,
     roamRadius = 900,
     petScanRadius = 250,
     stepSeconds = 0.55,
@@ -144,9 +141,8 @@ local state = {
     orbits = 0,
     forcePushUntil = 0,
     pathGoal = nil,
-    mounting = false,
-    wDown = false,
-    debug = { steal = nil, carry = nil, jumps = 0, dodges = 0 },
+    noclipOn = false,
+    debug = { steal = nil, carry = nil, jumps = 0 },
 }
 
 local blacklist = {}
@@ -154,7 +150,6 @@ local ignored = {}
 local dropGuards = {}
 local inDroppedZone
 local saveConfig
-local dismountNow
 local ui
 local api = {}
 local connections = {}
@@ -184,41 +179,197 @@ end
 
 local TURN_RATE = 10
 
-local function isMounted()
-    return LP:GetAttribute("Mounted") == true
-end
+local speed = {
+    base = 140,
+    applied = nil,
+    pct = 160,
+    measured = 0,
+    snapbacks = 0,
+    blocked = 0,
+    lines = 0,
+    lastSample = 0,
+    lastPos = nil,
+    still = 0,
+    lastTune = 0,
+    lastNotify = 0,
+}
 
-local function setMoveKey(on)
-    if state.wDown == on then
-        return
-    end
-    state.wDown = on
+local noclipSaved = {}
+
+local function notify(text)
     pcall(function()
-        VirtualInputManager:SendKeyEvent(on, Enum.KeyCode.W, false, game)
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Egg Farmer",
+            Text = text,
+            Duration = 4,
+        })
     end)
 end
 
-local function rideSteer(dir)
-    if not dir then
+local function setNoclip(on)
+    local ch = LP.Character
+    if not ch then
         return
     end
-    local cam = Workspace.CurrentCamera
-    if not cam then
+    if on then
+        for _, d in ipairs(ch:GetDescendants()) do
+            if d:IsA("BasePart") and d.CanCollide then
+                noclipSaved[d] = true
+                d.CanCollide = false
+            end
+        end
+    else
+        for part in pairs(noclipSaved) do
+            if part.Parent then
+                pcall(function()
+                    part.CanCollide = true
+                end)
+            end
+        end
+        table.clear(noclipSaved)
+    end
+end
+
+local function refreshBaseSpeed(hum)
+    local cur = hum.WalkSpeed
+    if cur <= 1 then
         return
     end
-    local flat = Vector3.new(dir.X, 0, dir.Z)
-    if flat.Magnitude < 0.01 then
+    if not speed.applied or math.abs(cur - speed.applied) > 0.5 then
+        speed.base = cur
+    end
+end
+
+local function desiredSpeed(dist)
+    if CONFIG.moveType ~= "fast" then
+        return speed.base
+    end
+    local pct = speed.pct
+    if dist and dist < 60 then
+        local f = math.clamp((dist - 6) / 54, 0.16, 1)
+        pct = pct * f
+    end
+    return math.max(speed.base * pct / 100, 8)
+end
+
+local function restoreSpeed(hum)
+    if speed.applied and hum then
+        hum.WalkSpeed = speed.base
+    end
+    speed.applied = nil
+end
+
+local function sampleSpeed(active, target)
+    local r = root()
+    if not r then
         return
     end
-    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, cam.CFrame.Position + flat.Unit)
+    local now = os.clock()
+    if not speed.lastPos then
+        speed.lastPos = r.Position
+        speed.lastSample = now
+        return
+    end
+    local dt = now - speed.lastSample
+    if dt < 0.25 then
+        return
+    end
+    local v = r.Position - speed.lastPos
+    local moved = Vector3.new(v.X, 0, v.Z).Magnitude
+    speed.lastPos = r.Position
+    speed.lastSample = now
+    local measured = moved / dt
+    speed.measured = measured
+    if not active or target < 100 then
+        speed.still = 0
+        return
+    end
+    local dir = state.moveDir
+    if dir then
+        local back = -(v.X * dir.X + v.Z * dir.Z)
+        if back > 8 then
+            speed.lines += 1
+            speed.snapbacks += 1
+            speed.pct = math.max(100, speed.pct - 10)
+            CONFIG.speedPct = math.floor(speed.pct)
+            speed.lastTune = now
+            speed.target = nil
+            speed.still = 0
+            if CONFIG.notifySnapback and now - speed.lastNotify > 5 then
+                speed.lastNotify = now
+                notify(string.format("Snapback - speed lowered to %d%%", math.floor(speed.pct)))
+            end
+            return
+        end
+    end
+    if moved > target * dt * 3 + 40 then
+        -- teleport / portal, not a real speed sample
+        speed.still = 0
+        speed.target = target
+        speed.targetAt = now
+        return
+    end
+    if math.abs(target - (speed.target or 0)) > 1 then
+        speed.target = target
+        speed.targetAt = now
+        speed.still = 0
+        return
+    end
+    if now - (speed.targetAt or 0) < 1.2 then
+        speed.still = 0
+        return
+    end
+    if measured < target * 0.35 then
+        speed.lines += 1
+        speed.still += 1
+        if measured < 2 then
+            speed.blocked += 1
+        end
+        if speed.still >= 2 and measured < 6 then
+            state.noclipFreezeUntil = now + 2
+        end
+        if speed.still >= 3 then
+            speed.still = 0
+            speed.snapbacks += 1
+            if CONFIG.moveType == "fast" then
+                speed.pct = math.max(100, speed.pct - 10)
+                CONFIG.speedPct = math.floor(speed.pct)
+            end
+            speed.lastTune = now
+            if CONFIG.notifySnapback and now - speed.lastNotify > 5 then
+                speed.lastNotify = now
+                notify(string.format("Snapback - speed lowered to %d%%", math.floor(speed.pct)))
+            end
+        end
+    else
+        speed.still = 0
+    end
+    if CONFIG.moveType == "fast" and now - speed.lastTune > 15 and speed.pct < CONFIG.speedMax then
+        speed.pct = math.min(CONFIG.speedMax, speed.pct + 5)
+        CONFIG.speedPct = math.floor(speed.pct)
+        speed.lastTune = now
+    end
+end
+
+local function setNoclipState(on)
+    if state.noclipOn == on then
+        return
+    end
+    state.noclipOn = on
+    setNoclip(on)
 end
 
 track(RunService.RenderStepped:Connect(function(dt)
+    local ch, hum = alive()
     if not state.moveTarget then
         state.moveDir = nil
+        if hum then
+            refreshBaseSpeed(hum)
+            restoreSpeed(hum)
+        end
+        setNoclipState(false)
         return
     end
-    local ch, hum = alive()
     local r = root()
     if not ch or not hum or not r then
         return
@@ -228,14 +379,27 @@ track(RunService.RenderStepped:Connect(function(dt)
     local dist = delta.Magnitude
     if dist < (state.stopRadius or 0.8) then
         state.moveDir = nil
-        state.moveToAt = nil
         hum:Move(Vector3.zero)
-        setMoveKey(false)
+        refreshBaseSpeed(hum)
+        restoreSpeed(hum)
+        setNoclipState(false)
+        sampleSpeed(false, 0)
         return
     end
     local desired = delta.Unit
     if state.nudge and os.clock() < state.nudge.until_ then
         desired = (desired + state.nudge.dir * 1.6).Unit
+    end
+    if CONFIG.teleportCheck and CONFIG.moveType == "fast"
+        and LP:GetAttribute("Carrying") == nil and dist > 70
+        and os.clock() - (state.tpAt or 0) > 0.35 then
+        state.tpAt = os.clock()
+        local step = math.min(18, dist - 40)
+        if step > 2 then
+            local p = r.Position + desired * step
+            r.CFrame = CFrame.new(p.X, p.Y + 1, p.Z)
+            r.AssemblyLinearVelocity = Vector3.zero
+        end
     end
     local current = state.moveDir
     if current and dist > 4 and os.clock() >= state.forcePushUntil then
@@ -246,17 +410,12 @@ track(RunService.RenderStepped:Connect(function(dt)
     else
         state.moveDir = desired
     end
-    if isMounted() then
-        if UIS:GetFocusedTextBox() then
-            setMoveKey(false)
-        else
-            rideSteer(state.moveDir)
-            setMoveKey(true)
-        end
-    else
-        setMoveKey(false)
-        hum:Move(state.moveDir)
-    end
+    setNoclipState(CONFIG.noclip == true and os.clock() >= (state.noclipFreezeUntil or 0))
+    refreshBaseSpeed(hum)
+    hum.WalkSpeed = desiredSpeed(dist)
+    speed.applied = hum.WalkSpeed
+    hum:Move(state.moveDir)
+    sampleSpeed(true, hum.WalkSpeed)
     local stall = state.stall
     if not stall or (stall.pos - r.Position).Magnitude > 2 then
         state.stall = { pos = r.Position, at = os.clock() }
@@ -280,20 +439,18 @@ local function stopMove()
     state.moveDir = nil
     state.stopRadius = nil
     state.moveToAt = nil
-    setMoveKey(false)
     local _, hum = alive()
     if hum then
         hum:Move(Vector3.zero)
+        restoreSpeed(hum)
     end
+    setNoclipState(false)
 end
 
 local function cleanup()
     state.running = false
     state.runId += 1
     stopMove()
-    if dismountNow then
-        pcall(dismountNow)
-    end
     pcall(function()
         AutoSwing.SetOn(false)
     end)
@@ -663,146 +820,6 @@ local function ensureSwing()
     return true
 end
 
-local mountState = { name = nil, bonus = nil, fails = 0, lastMount = 0 }
-
-local function rideableTools()
-    local list = {}
-    local backpack = LP:FindFirstChild("Backpack")
-    local ch = LP.Character
-    for _, holder in ipairs({ backpack, ch }) do
-        if holder then
-            for _, tool in ipairs(holder:GetChildren()) do
-                if tool:IsA("Tool") and CS:HasTag(tool, "RideableTool") then
-                    list[#list + 1] = tool
-                end
-            end
-        end
-    end
-    return list
-end
-
-local function speedBonusFor(name)
-    if not RideConfig or type(RideConfig.Animals) ~= "table" then
-        return 0
-    end
-    for _, animal in ipairs(RideConfig.Animals) do
-        if animal.Name == name then
-            return animal.SpeedBonus or 0
-        end
-    end
-    return 0
-end
-
-local function bestRideable()
-    local best, bestName, bestBonus = nil, nil, -1
-    for _, tool in ipairs(rideableTools()) do
-        local name = tool:GetAttribute("RideableName") or tool.Name
-        if type(name) == "string" then
-            local bonus = speedBonusFor(name)
-            if bonus > bestBonus then
-                best, bestName, bestBonus = tool, name, bonus
-            end
-        end
-    end
-    return best, bestName, bestBonus
-end
-
-local function mountUp()
-    if not CONFIG.autoMount or not RideRemote then
-        return false
-    end
-    if isMounted() then
-        return true
-    end
-    local tool, name, bonus = bestRideable()
-    if not tool then
-        return false
-    end
-    mountState.name = name
-    mountState.bonus = bonus
-    for _ = 1, 3 do
-        local ch, hum = alive()
-        if not ch or not hum then
-            return false
-        end
-        if not ch:FindFirstChild(tool.Name) then
-            pcall(function()
-                hum:EquipTool(tool)
-            end)
-        end
-        local started = os.clock()
-        local held = nil
-        while os.clock() - started < 1 do
-            held = LP:GetAttribute("HeldRideable")
-            if type(held) == "string" then
-                break
-            end
-            task.wait(0.05)
-        end
-        if type(held) == "string" then
-            pcall(function()
-                RideRemote:FireServer("Mount", held)
-            end)
-            local mountedAt = os.clock()
-            while os.clock() - mountedAt < 1.2 do
-                if isMounted() then
-                    equipPickaxe()
-                    mountState.fails = 0
-                    mountState.lastMount = os.clock()
-                    return true
-                end
-                task.wait(0.05)
-            end
-        end
-        task.wait(0.2)
-    end
-    mountState.fails += 1
-    return false
-end
-
-dismountNow = function()
-    setMoveKey(false)
-    if not isMounted() then
-        return true
-    end
-    if RideRemote then
-        pcall(function()
-            RideRemote:FireServer("Dismount", nil)
-        end)
-    end
-    local started = os.clock()
-    while os.clock() - started < 1 do
-        if not isMounted() then
-            return true
-        end
-        task.wait(0.05)
-    end
-    return not isMounted()
-end
-
-local function updateMount(dist)
-    if not CONFIG.autoMount then
-        return
-    end
-    if isMounted() then
-        if dist < 80 then
-            dismountNow()
-        end
-        return
-    end
-    if dist < 400 or state.mounting or mountState.fails >= 3 then
-        return
-    end
-    if os.clock() - (mountState.lastMount or 0) < 10 then
-        return
-    end
-    state.mounting = true
-    task.spawn(function()
-        mountUp()
-        state.mounting = false
-    end)
-end
-
 local function walkTo(target, maxTime)
     local ch, hum = alive()
     if not ch or not hum then
@@ -943,81 +960,6 @@ local function steal(model)
     return LP:GetAttribute("Carrying") ~= nil
 end
 
-local guardDodge = { until_ = 0, dir = nil, side = 1 }
-
-local function guardThreat()
-    local r = root()
-    if not r then
-        return nil
-    end
-    local best, bestD, bestState = nil, math.huge, nil
-    for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
-        local st = g:GetAttribute("ChaseState")
-        if st == "Chasing" or st == "WindUp" then
-            local owner = g:GetAttribute("CaughtUserId")
-            if owner == nil or owner == LP.UserId then
-                local ok, pivot = pcall(function()
-                    return g:GetPivot().Position
-                end)
-                if ok and pivot then
-                    local d = (flatten(pivot) - flatten(r.Position)).Magnitude
-                    if d < bestD then
-                        best, bestD, bestState = g, d, st
-                    end
-                end
-            end
-        end
-    end
-    return best, bestD, bestState
-end
-
-local function evadeGuard()
-    if not CONFIG.evade then
-        guardDodge.until_ = 0
-        return false
-    end
-    local r = root()
-    local ch, hum = alive()
-    if not r or not hum then
-        return false
-    end
-    local active = os.clock() < guardDodge.until_
-    if not active then
-        local guard, dist, gstate = guardThreat()
-        if not guard then
-            return false
-        end
-        if dist > 45 and gstate ~= "WindUp" then
-            return false
-        end
-        guardDodge.side = -guardDodge.side
-        local away = flatten(r.Position - guard:GetPivot().Position)
-        if away.Magnitude < 0.1 then
-            away = Vector3.new(0, 0, 1)
-        end
-        away = away.Unit
-        local side = Vector3.new(-away.Z, 0, away.X)
-        local anchor = state.pathGoal
-        local goalDir = anchor and flatten(anchor - r.Position) or Vector3.zero
-        if goalDir.Magnitude > 1 then
-            goalDir = goalDir.Unit
-        else
-            goalDir = Vector3.zero
-        end
-        guardDodge.dir = (goalDir * 1.5 + side * 1.3 * guardDodge.side + away * 0.7).Unit
-        guardDodge.until_ = os.clock() + 0.6
-        state.debug.dodges += 1
-        if hum.FloorMaterial ~= Enum.Material.Air then
-            hum.Jump = true
-        end
-        setStatus(string.format("Dodging %s", guard.Name))
-    end
-    state.stopRadius = 1
-    state.moveTarget = r.Position + guardDodge.dir * 20
-    task.wait(0.05)
-    return true
-end
-
 local function dropCarried()
     state.intentionalDrop = true
     for _ = 1, 3 do
@@ -1106,9 +1048,6 @@ local function handleCarried()
         if LP:GetAttribute("Carrying") == nil then
             break
         end
-        if evadeGuard() then
-            continue
-        end
         state.moveTarget = anchor
         local p = root()
         if not p then
@@ -1174,9 +1113,6 @@ local function farmStep(runId)
         return
     end
 
-    if evadeGuard() then
-        return
-    end
 
     if state.recover then
         if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
@@ -1349,7 +1285,6 @@ local function farmStep(runId)
             local flat = Vector3.new(r0.Position.X, 0, r0.Position.Z)
             local target = Vector3.new(anchor.X, 0, anchor.Z)
             local anchorDist = (flat - target).Magnitude
-            updateMount(anchorDist)
             if anchorDist > 60 then
                 setStatus(string.format("Walking to Zone%d...", z))
                 state.pathGoal = anchor
@@ -1373,7 +1308,6 @@ local function farmStep(runId)
         return
     end
     local dist = EggTargeting.SurfaceDistance(egg, r.Position)
-    updateMount(dist)
     setStatus(string.format(
         "Farming Zone%s · %s (%dm)",
         tostring(egg:GetAttribute("ZoneIndex") or "?"),
@@ -1491,11 +1425,23 @@ local function loadConfig()
         if type(data.autoGems) == "boolean" then
             CONFIG.autoGems = data.autoGems
         end
-        if type(data.evade) == "boolean" then
-            CONFIG.evade = data.evade
+        if data.moveType == "fast" or data.moveType == "normal" then
+            CONFIG.moveType = data.moveType
         end
-        if type(data.autoMount) == "boolean" then
-            CONFIG.autoMount = data.autoMount
+        if type(data.speedPct) == "number" then
+            CONFIG.speedPct = math.clamp(data.speedPct, 100, 200)
+        end
+        if type(data.speedMax) == "number" then
+            CONFIG.speedMax = math.clamp(data.speedMax, 100, 300)
+        end
+        if type(data.noclip) == "boolean" then
+            CONFIG.noclip = data.noclip
+        end
+        if type(data.notifySnapback) == "boolean" then
+            CONFIG.notifySnapback = data.notifySnapback
+        end
+        if type(data.teleportCheck) == "boolean" then
+            CONFIG.teleportCheck = data.teleportCheck
         end
         if data.version == CONFIG_VERSION and type(data.selected) == "table" then
             for _, name in ipairs(data.selected) do
@@ -1524,8 +1470,12 @@ function saveConfig()
             minCps = CONFIG.minCps,
             dropArea = CONFIG.dropArea,
             autoGems = CONFIG.autoGems,
-            evade = CONFIG.evade,
-            autoMount = CONFIG.autoMount,
+            moveType = CONFIG.moveType,
+            speedPct = math.floor(speed.pct),
+            speedMax = CONFIG.speedMax,
+            noclip = CONFIG.noclip,
+            notifySnapback = CONFIG.notifySnapback,
+            teleportCheck = CONFIG.teleportCheck,
             selected = list,
         }))
     end)
@@ -1712,6 +1662,7 @@ local function buildUI()
     end
     local farmTabButton, farmUnderline = makeTabButton("Farm", 0)
     local dropTabButton, dropUnderline = makeTabButton("Drop", 84)
+    local moveTabButton, moveUnderline = makeTabButton("Move", 168)
 
     local content = Instance.new("Frame")
     content.Size = UDim2.new(1, 0, 0, 0)
@@ -1747,16 +1698,31 @@ local function buildUI()
     dropList.SortOrder = Enum.SortOrder.LayoutOrder
     dropList.Parent = dropTab
 
+    local moveTab = Instance.new("Frame")
+    moveTab.Size = UDim2.new(1, 0, 0, 0)
+    moveTab.AutomaticSize = Enum.AutomaticSize.Y
+    moveTab.BackgroundTransparency = 1
+    moveTab.Visible = false
+    moveTab.LayoutOrder = 3
+    moveTab.Parent = content
+    local moveList = Instance.new("UIListLayout")
+    moveList.Padding = UDim.new(0, 12)
+    moveList.SortOrder = Enum.SortOrder.LayoutOrder
+    moveList.Parent = moveTab
+
     local closeAllDropdowns
     local activeTab = "farm"
     local function setTab(name)
         activeTab = name
         farmTab.Visible = name == "farm"
         dropTab.Visible = name == "drop"
+        moveTab.Visible = name == "move"
         farmTabButton.TextColor3 = name == "farm" and COLORS.text or COLORS.muted
         dropTabButton.TextColor3 = name == "drop" and COLORS.text or COLORS.muted
+        moveTabButton.TextColor3 = name == "move" and COLORS.text or COLORS.muted
         farmUnderline.Visible = name == "farm"
         dropUnderline.Visible = name == "drop"
+        moveUnderline.Visible = name == "move"
         if closeAllDropdowns then
             closeAllDropdowns()
         end
@@ -1766,6 +1732,9 @@ local function buildUI()
     end)
     dropTabButton.MouseButton1Click:Connect(function()
         setTab("drop")
+    end)
+    moveTabButton.MouseButton1Click:Connect(function()
+        setTab("move")
     end)
 
     local minRow = Instance.new("Frame")
@@ -1830,36 +1799,6 @@ local function buildUI()
     gemToggle.Position = UDim2.new(1, 0, 0.5, 0)
     gemToggle.TextSize = 13
 
-    local evadeRow = Instance.new("Frame")
-    evadeRow.Size = UDim2.new(1, 0, 0, 34)
-    evadeRow.BackgroundTransparency = 1
-    evadeRow.LayoutOrder = 4
-    evadeRow.Parent = farmTab
-
-    local evadeLabel = text(evadeRow, "Dodge guards", 14, COLORS.muted)
-    evadeLabel.Size = UDim2.new(1, -80, 1, 0)
-
-    local evadeToggle = makeButton(evadeRow, CONFIG.evade and "On" or "Off", false, 30)
-    evadeToggle.Size = UDim2.fromOffset(70, 30)
-    evadeToggle.AnchorPoint = Vector2.new(1, 0.5)
-    evadeToggle.Position = UDim2.new(1, 0, 0.5, 0)
-    evadeToggle.TextSize = 13
-
-    local mountRow = Instance.new("Frame")
-    mountRow.Size = UDim2.new(1, 0, 0, 34)
-    mountRow.BackgroundTransparency = 1
-    mountRow.LayoutOrder = 5
-    mountRow.Parent = farmTab
-
-    local mountLabel = text(mountRow, "Auto mount", 14, COLORS.muted)
-    mountLabel.Size = UDim2.new(1, -80, 1, 0)
-
-    local mountToggle = makeButton(mountRow, CONFIG.autoMount and "On" or "Off", false, 30)
-    mountToggle.Size = UDim2.fromOffset(70, 30)
-    mountToggle.AnchorPoint = Vector2.new(1, 0.5)
-    mountToggle.Position = UDim2.new(1, 0, 0.5, 0)
-    mountToggle.TextSize = 13
-
     local dropRow = Instance.new("Frame")
     dropRow.Size = UDim2.new(1, 0, 0, 38)
     dropRow.BackgroundTransparency = 1
@@ -1888,6 +1827,102 @@ local function buildUI()
     dropHelp.AutomaticSize = Enum.AutomaticSize.Y
     dropHelp.TextWrapped = true
     dropHelp.LayoutOrder = 2
+
+    local moveTypeRow = Instance.new("Frame")
+    moveTypeRow.Size = UDim2.new(1, 0, 0, 38)
+    moveTypeRow.BackgroundTransparency = 1
+    moveTypeRow.LayoutOrder = 1
+    moveTypeRow.Parent = moveTab
+
+    local moveTypeLabel = text(moveTypeRow, "Movement type", 14, COLORS.muted)
+    moveTypeLabel.Size = UDim2.new(1, -120, 1, 0)
+
+    local moveTypeButton = makeButton(moveTypeRow, CONFIG.moveType == "fast" and "Fast" or "Normal", false, 34)
+    moveTypeButton.Size = UDim2.fromOffset(110, 34)
+    moveTypeButton.AnchorPoint = Vector2.new(1, 0.5)
+    moveTypeButton.Position = UDim2.new(1, 0, 0.5, 0)
+    moveTypeButton.TextSize = 14
+
+    local speedRow = Instance.new("Frame")
+    speedRow.Size = UDim2.new(1, 0, 0, 38)
+    speedRow.BackgroundTransparency = 1
+    speedRow.LayoutOrder = 2
+    speedRow.Parent = moveTab
+
+    local speedRowLabel = text(speedRow, "Fast speed (max)", 14, COLORS.muted)
+    speedRowLabel.Size = UDim2.new(1, -100, 1, 0)
+
+    local speedBox = Instance.new("TextBox")
+    speedBox.Size = UDim2.fromOffset(84, 34)
+    speedBox.AnchorPoint = Vector2.new(1, 0.5)
+    speedBox.Position = UDim2.new(1, 0, 0.5, 0)
+    speedBox.BackgroundColor3 = COLORS.surface
+    speedBox.BorderSizePixel = 0
+    speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
+    speedBox.PlaceholderText = "200%"
+    speedBox.TextColor3 = COLORS.text
+    speedBox.PlaceholderColor3 = COLORS.muted
+    speedBox.TextSize = 14
+    speedBox.Font = Enum.Font.Roboto
+    if FACE_REGULAR then
+        speedBox.FontFace = FACE_REGULAR
+    end
+    speedBox.TextXAlignment = Enum.TextXAlignment.Center
+    speedBox.ClearTextOnFocus = false
+    speedBox.Parent = speedRow
+    corner(speedBox, 6)
+    stroke(speedBox, COLORS.border)
+
+    local tpRow = Instance.new("Frame")
+    tpRow.Size = UDim2.new(1, 0, 0, 34)
+    tpRow.BackgroundTransparency = 1
+    tpRow.LayoutOrder = 3
+    tpRow.Parent = moveTab
+
+    local tpLabel = text(tpRow, "Speed check with teleport", 14, COLORS.muted)
+    tpLabel.Size = UDim2.new(1, -80, 1, 0)
+
+    local tpToggle = makeButton(tpRow, CONFIG.teleportCheck and "On" or "Off", false, 30)
+    tpToggle.Size = UDim2.fromOffset(70, 30)
+    tpToggle.AnchorPoint = Vector2.new(1, 0.5)
+    tpToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    tpToggle.TextSize = 13
+
+    local noclipRow = Instance.new("Frame")
+    noclipRow.Size = UDim2.new(1, 0, 0, 34)
+    noclipRow.BackgroundTransparency = 1
+    noclipRow.LayoutOrder = 4
+    noclipRow.Parent = moveTab
+
+    local noclipLabel = text(noclipRow, "Noclip while travelling", 14, COLORS.muted)
+    noclipLabel.Size = UDim2.new(1, -80, 1, 0)
+
+    local noclipToggle = makeButton(noclipRow, CONFIG.noclip and "On" or "Off", false, 30)
+    noclipToggle.Size = UDim2.fromOffset(70, 30)
+    noclipToggle.AnchorPoint = Vector2.new(1, 0.5)
+    noclipToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    noclipToggle.TextSize = 13
+
+    local notifyRow = Instance.new("Frame")
+    notifyRow.Size = UDim2.new(1, 0, 0, 34)
+    notifyRow.BackgroundTransparency = 1
+    notifyRow.LayoutOrder = 5
+    notifyRow.Parent = moveTab
+
+    local notifyLabel = text(notifyRow, "Notify on snapback", 14, COLORS.muted)
+    notifyLabel.Size = UDim2.new(1, -80, 1, 0)
+
+    local notifyToggle = makeButton(notifyRow, CONFIG.notifySnapback and "On" or "Off", false, 30)
+    notifyToggle.Size = UDim2.fromOffset(70, 30)
+    notifyToggle.AnchorPoint = Vector2.new(1, 0.5)
+    notifyToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    notifyToggle.TextSize = 13
+
+    local moveStats = text(moveTab, "Speed now 0 studs/s", 12, COLORS.muted)
+    moveStats.Size = UDim2.new(1, 0, 0, 0)
+    moveStats.AutomaticSize = Enum.AutomaticSize.Y
+    moveStats.TextWrapped = true
+    moveStats.LayoutOrder = 6
 
     local errorLabel = text(farmTab, "", 13, COLORS.text)
     errorLabel.Size = UDim2.new(1, 0, 0, 0)
@@ -2364,24 +2399,22 @@ local function buildUI()
         gemToggle:SetAttribute("pressColor", gemPress)
         gemToggle.BackgroundColor3 = gemBase
         gemToggle.TextColor3 = CONFIG.autoGems and COLORS.accentText or COLORS.text
-        evadeToggle.Text = CONFIG.evade and "On" or "Off"
-        local evadeBase = CONFIG.evade and COLORS.accent or COLORS.surface
-        local evadeHover = CONFIG.evade and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
-        local evadePress = CONFIG.evade and Color3.fromRGB(200, 200, 200) or COLORS.border
-        evadeToggle:SetAttribute("baseColor", evadeBase)
-        evadeToggle:SetAttribute("hoverColor", evadeHover)
-        evadeToggle:SetAttribute("pressColor", evadePress)
-        evadeToggle.BackgroundColor3 = evadeBase
-        evadeToggle.TextColor3 = CONFIG.evade and COLORS.accentText or COLORS.text
-        mountToggle.Text = CONFIG.autoMount and "On" or "Off"
-        local mountBase = CONFIG.autoMount and COLORS.accent or COLORS.surface
-        local mountHover = CONFIG.autoMount and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
-        local mountPress = CONFIG.autoMount and Color3.fromRGB(200, 200, 200) or COLORS.border
-        mountToggle:SetAttribute("baseColor", mountBase)
-        mountToggle:SetAttribute("hoverColor", mountHover)
-        mountToggle:SetAttribute("pressColor", mountPress)
-        mountToggle.BackgroundColor3 = mountBase
-        mountToggle.TextColor3 = CONFIG.autoMount and COLORS.accentText or COLORS.text
+        moveTypeButton.Text = CONFIG.moveType == "fast" and "Fast" or "Normal"
+        speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
+        local function styleToggle(button, on)
+            local b = on and COLORS.accent or COLORS.surface
+            local h = on and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
+            local p = on and Color3.fromRGB(200, 200, 200) or COLORS.border
+            button:SetAttribute("baseColor", b)
+            button:SetAttribute("hoverColor", h)
+            button:SetAttribute("pressColor", p)
+            button.BackgroundColor3 = b
+            button.TextColor3 = on and COLORS.accentText or COLORS.text
+            button.Text = on and "On" or "Off"
+        end
+        styleToggle(tpToggle, CONFIG.teleportCheck)
+        styleToggle(noclipToggle, CONFIG.noclip)
+        styleToggle(notifyToggle, CONFIG.notifySnapback)
         dropButton.Text = dropLabel()
         refreshDropOptions()
         ui.refreshEggButton()
@@ -2428,12 +2461,29 @@ local function buildUI()
         api.setAutoGems(not CONFIG.autoGems)
     end)
 
-    evadeToggle.MouseButton1Click:Connect(function()
-        api.setEvade(not CONFIG.evade)
+    moveTypeButton.MouseButton1Click:Connect(function()
+        api.setMoveType(CONFIG.moveType == "fast" and "normal" or "fast")
     end)
 
-    mountToggle.MouseButton1Click:Connect(function()
-        api.setAutoMount(not CONFIG.autoMount)
+    speedBox.FocusLost:Connect(function()
+        local n = tonumber((string.gsub(speedBox.Text, "[^%d]", "")))
+        if n then
+            api.setSpeedMax(n)
+        else
+            speedBox.Text = tostring(math.floor(CONFIG.speedMax)) .. "%"
+        end
+    end)
+
+    tpToggle.MouseButton1Click:Connect(function()
+        api.setTeleportCheck(not CONFIG.teleportCheck)
+    end)
+
+    noclipToggle.MouseButton1Click:Connect(function()
+        api.setNoclip(not CONFIG.noclip)
+    end)
+
+    notifyToggle.MouseButton1Click:Connect(function()
+        api.setNotifySnapback(not CONFIG.notifySnapback)
     end)
 
     toggleButton.MouseButton1Click:Connect(function()
@@ -2457,9 +2507,29 @@ local function buildUI()
         elseif input.KeyCode == Enum.KeyCode.K then
             api.toggle()
         elseif input.KeyCode == Enum.KeyCode.Tab and screen.Enabled then
-            setTab(activeTab == "farm" and "drop" or "farm")
+            if activeTab == "farm" then
+                setTab("drop")
+            elseif activeTab == "drop" then
+                setTab("move")
+            else
+                setTab("farm")
+            end
         end
     end))
+
+    task.spawn(function()
+        while screen.Parent do
+            moveStats.Text = string.format(
+                "Speed now %d studs/s · Fast boost %d%%\nSnapbacks %d · anti-cheat lines %d · blocked %d",
+                math.floor(speed.measured),
+                math.floor(speed.pct),
+                speed.snapbacks,
+                speed.lines,
+                speed.blocked
+            )
+            task.wait(0.5)
+        end
+    end)
 
     ui.refresh()
     return screen
@@ -2491,22 +2561,55 @@ function api.setAutoGems(value)
     end
 end
 
-function api.setEvade(value)
-    CONFIG.evade = value == true
-    guardDodge.until_ = 0
+function api.setMoveType(value)
+    CONFIG.moveType = value == "normal" and "normal" or "fast"
     saveConfig()
     if ui then
         ui.refresh()
     end
 end
 
-function api.setAutoMount(value)
-    CONFIG.autoMount = value == true
-    mountState.fails = 0
-    mountState.lastMount = 0
-    if not CONFIG.autoMount then
-        pcall(dismountNow)
+function api.setSpeedPct(value)
+    speed.pct = math.clamp(value or 160, 100, CONFIG.speedMax)
+    CONFIG.speedPct = math.floor(speed.pct)
+    saveConfig()
+    if ui then
+        ui.refresh()
     end
+end
+
+function api.setSpeedMax(value)
+    CONFIG.speedMax = math.clamp(value or 200, 100, 300)
+    if speed.pct > CONFIG.speedMax then
+        speed.pct = CONFIG.speedMax
+    end
+    saveConfig()
+    if ui then
+        ui.refresh()
+    end
+end
+
+function api.setNoclip(value)
+    CONFIG.noclip = value == true
+    if not CONFIG.noclip then
+        setNoclipState(false)
+    end
+    saveConfig()
+    if ui then
+        ui.refresh()
+    end
+end
+
+function api.setNotifySnapback(value)
+    CONFIG.notifySnapback = value == true
+    saveConfig()
+    if ui then
+        ui.refresh()
+    end
+end
+
+function api.setTeleportCheck(value)
+    CONFIG.teleportCheck = value == true
     saveConfig()
     if ui then
         ui.refresh()
@@ -2606,9 +2709,6 @@ function api.stop()
     state.approach = nil
     state.forcePushUntil = 0
     state.pathGoal = nil
-    state.mounting = false
-    guardDodge.until_ = 0
-    dismountNow()
     stopMove()
     setStatus("Stopped")
     pcall(function()
@@ -2639,18 +2739,22 @@ function api.getState()
         dropZone = dropZoneName(),
         dropArea = CONFIG.dropArea,
         autoGems = CONFIG.autoGems,
-        evade = CONFIG.evade,
-        autoMount = CONFIG.autoMount,
-        mounted = isMounted(),
-        mountName = mountState.name,
-        mountBonus = mountState.bonus,
+        moveType = CONFIG.moveType,
+        speedPct = math.floor(speed.pct),
+        speedMax = CONFIG.speedMax,
+        speedNow = math.floor(speed.measured),
+        snapbacks = speed.snapbacks,
+        antiCheatLines = speed.lines,
+        blocked = speed.blocked,
+        noclip = CONFIG.noclip,
+        notifySnapback = CONFIG.notifySnapback,
+        teleportCheck = CONFIG.teleportCheck,
         recovering = state.recover ~= nil,
         recoverName = state.recover and state.recover.name or nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
         targetHp = state.targetEgg and state.targetEgg:GetAttribute("Health") or nil,
         swings = state.swingCount,
         orbits = state.orbits,
-        dodges = state.debug.dodges,
         carrying = tostring(LP:GetAttribute("Carrying")),
         steal = state.debug.steal,
         carryInfo = state.debug.carry,
@@ -2659,6 +2763,13 @@ function api.getState()
 end
 
 loadConfig()
+speed.pct = CONFIG.speedPct
+do
+    local _, hum = alive()
+    if hum then
+        speed.base = hum.WalkSpeed
+    end
+end
 buildUI()
 getgenv().EggFarmer = api
 getgenv().EggFarmerUI = ui

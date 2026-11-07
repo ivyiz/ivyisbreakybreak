@@ -14,9 +14,8 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 - Auto-drop carried pets at Zone 1 or Safe Zone.
 - Boss pet-drop recovery: if a boss pet is taken from you, the script walks back and re-steals it.
 - Auto collect gems: after a gem drop the script walks onto the pieces so the magnet picks them up.
-- Auto mount: for long runs (over 400 studs) it hops on the fastest rideable you own, then dismounts for the last 80 studs so the approach stays precise. Swinging works while mounted too.
-- Dodge guards: while a ZoneGuard is chasing close, the script weaves sideways and jumps instead of running in a straight line.
-- Never freezes in place while chased: if the character stops making progress it jumps and sidesteps until it moves again.
+- Movement tab: speed boost up to 200% of your base walk speed, auto-tuned to the fastest value the server accepts, with noclip while travelling and snapback alerts.
+- Never freezes in place: if the character stops making progress it jumps and sidesteps until it moves again.
 - Swing rate follows the game's own cooldown, so pickaxe tiers, the x2 fast-swing gamepass, swing potions and Swinging mastery all apply automatically.
 - Auto rejoin on disconnect.
 - Config saved between sessions.
@@ -27,7 +26,19 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 | --- | --- |
 | `F` | Start / stop farming |
 | `K` | Toggle the UI |
-| `Tab` | Collapse / expand the UI |
+| `Tab` | Switch tab (Farm / Drop / Move) |
+
+## Movement tab
+
+| Control | Default | What it does |
+| --- | --- | --- |
+| Movement type | Fast | Fast = walk speed boost, Normal = 100% |
+| Fast speed (max) | 200% | Upper bound the auto-tune may reach |
+| Speed check with teleport | Off | Steps forward with short teleports instead of running |
+| Noclip while travelling | On | Ignores collisions while moving, restores on stop |
+| Notify on snapback | On | Sends a notification when the server pulls you back |
+
+The speed percentage is auto-tuned at runtime: it climbs 5% every 15s while everything looks clean, and drops 10% when a snapback or a full block is detected. The footer shows live speed, snapbacks, anti-cheat lines and blocks.
 
 ## Usage
 
@@ -61,8 +72,12 @@ api.clearSelection()
 api.setMin(50e9)                    -- minimum pet CPS to keep
 api.setDropArea("safe")             -- "safe" | "zone1"
 api.setAutoGems(true)               -- walk onto gem drops
-api.setEvade(true)                  -- dodge guards while carrying
-api.setAutoMount(true)              -- ride the fastest owned mount on long walks
+api.setMoveType("fast")             -- "fast" | "normal"
+api.setSpeedPct(160)                -- current boost percentage
+api.setSpeedMax(200)                -- upper bound for auto-tune
+api.setNoclip(true)                 -- ignore collisions while travelling
+api.setNotifySnapback(true)         -- notify when the server pulls you back
+api.setTeleportCheck(false)         -- travel with short teleport steps
 ```
 
 `getgenv().EggFarmerCleanup` tears down the UI and all connections; loading the script again calls it automatically.
