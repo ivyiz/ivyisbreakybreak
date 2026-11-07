@@ -39,7 +39,7 @@ The UI opens on load. Pick the zones/eggs, set a minimum CPS, choose the drop ar
 
 ## Guard gate
 
-The script measures the distance to the nearest ZoneGuard before starting a steal or a new egg. The safe distance is half the current zone's length (clamped to 40–500 studs), so a guard standing around the middle of the zone is considered far enough. If a guard is closer, the script waits; after 30 s it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt.
+The script measures the distance to the **guard of the zone being farmed** (other zones' guards are ignored) before starting a steal or a new egg. The safe distance is half that zone's length (clamped to 40–500 studs), so a guard standing around the middle of the zone is considered far enough. If the guard is closer, the script waits; after 30 s it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt. A guard that is actively chasing you is always treated as unsafe.
 
 Run the reconnect companion the same way:
 

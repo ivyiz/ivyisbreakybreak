@@ -469,6 +469,13 @@ local function zoneStartX(z)
     return part.Position.X + part.Size.X / 2
 end
 
+local function zoneIndexFromId(zoneId)
+    if type(zoneId) ~= "string" then
+        return nil
+    end
+    return tonumber(string.match(zoneId, "%d+"))
+end
+
 local function zoneSafeDist(zoneIndex)
     if CONFIG.guardSafeDist and CONFIG.guardSafeDist > 0 then
         return CONFIG.guardSafeDist
@@ -480,42 +487,71 @@ local function zoneSafeDist(zoneIndex)
     return math.clamp(part.Size.X / 2, 40, 500)
 end
 
-local function guardSafeDistFor()
-    local z = tonumber(string.match(zoneName(), "%d+")) or 1
-    return zoneSafeDist(z)
+local function guardZoneId()
+    local z = state.guardZone
+    if type(z) == "string" then
+        return z
+    end
+    return "Zone" .. tostring(tonumber(string.match(zoneName(), "%d+")) or 1)
 end
 
-local function nearestGuard()
+local function guardSafeDistFor()
+    return zoneSafeDist(zoneIndexFromId(guardZoneId()) or 1)
+end
+
+local function guardForZone(zoneId)
+    for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
+        if g:GetAttribute("ZoneId") == zoneId then
+            return g
+        end
+    end
+    return nil
+end
+
+local function guardDistanceFor(zoneId)
     local r = root()
     if not r then
-        return nil, math.huge
+        return math.huge
     end
-    local best, bestD = nil, math.huge
+    local g = guardForZone(zoneId)
+    if not g then
+        return math.huge
+    end
+    local ok, pivot = pcall(function()
+        return g:GetPivot().Position
+    end)
+    if not ok or not pivot then
+        return math.huge
+    end
+    return (pivot - r.Position).Magnitude
+end
+
+local function guardChasingMe()
     for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
-        local ok, pivot = pcall(function()
-            return g:GetPivot().Position
-        end)
-        if ok and pivot then
-            local d = (pivot - r.Position).Magnitude
-            if d < bestD then
-                best, bestD = g, d
+        local st = g:GetAttribute("ChaseState")
+        if st == "Chasing" or st == "WindUp" then
+            local owner = g:GetAttribute("CaughtUserId")
+            if owner == nil or owner == LP.UserId then
+                return true
             end
         end
     end
-    return best, bestD
+    return false
 end
 
 local guardWait = { since = 0, retreatUntil = 0 }
 
-local function guardAllows()
+local function guardAllows(zoneId)
     if not CONFIG.guardGate then
         return true
     end
-    local _, d = nearestGuard()
+    zoneId = type(zoneId) == "string" and zoneId or guardZoneId()
+    state.guardZone = zoneId
+    local d = guardDistanceFor(zoneId)
     state.guardDist = d
-    local need = guardSafeDistFor()
+    local need = zoneSafeDist(zoneIndexFromId(zoneId) or 1)
     local now = os.clock()
-    if d >= need then
+    if d >= need and not guardChasingMe() then
         guardWait.since = 0
         return true
     end
@@ -530,7 +566,8 @@ local function guardAllows()
         local r = root()
         local z = tonumber(string.match(zoneName(), "%d+")) or 1
         local startX = zoneStartX(z)
-        if r and startX and now >= guardWait.retreatUntil then
+        local myZone = "Zone" .. tostring(z)
+        if myZone == zoneId and r and startX and now >= guardWait.retreatUntil then
             guardWait.retreatUntil = now + 4
             state.pathGoal = Vector3.new(startX - 15, r.Position.Y, r.Position.Z)
             state.stopRadius = 4
@@ -539,7 +576,7 @@ local function guardAllows()
     else
         stopMove()
     end
-    setStatus(string.format("Waiting for guard (%dm < %dm)", math.floor(d), math.floor(need)))
+    setStatus(string.format("Waiting for guard %s (%dm < %dm)", zoneId:gsub("Zone", "Z"), math.floor(d), math.floor(need)))
     task.wait(0.3)
     return false
 end
@@ -1143,7 +1180,11 @@ local function farmStep(runId)
 
     local pet = findWantedPet()
     if pet then
-        if not guardAllows() then
+        local petZone = tostring(ZoneLookup.GetZoneAt(pet:GetPivot().Position))
+        if petZone == "nil" or petZone == "" then
+            petZone = "Zone1"
+        end
+        if not guardAllows(petZone) then
             return
         end
         state.pendingCps = petCps(pet)
@@ -1168,7 +1209,8 @@ local function farmStep(runId)
     local egg = state.targetEgg
     if not egg or not egg.Parent or not EggTargeting.IsLive(egg) or not allowed(egg) then
         egg = nil
-        if not guardAllows() then
+        local wantZone = highestSelectedZone()
+        if not guardAllows(wantZone and ("Zone" .. tostring(wantZone)) or nil) then
             return
         end
         if state.targetEgg then
@@ -2465,6 +2507,7 @@ function api.getState()
         autoGems = CONFIG.autoGems,
         zoneStart = CONFIG.zoneStart,
         guardGate = CONFIG.guardGate,
+        guardZone = state.guardZone,
         guardSafeDist = guardSafeDistFor(),
         recovering = state.recover ~= nil,
         recoverName = state.recover and state.recover.name or nil,
