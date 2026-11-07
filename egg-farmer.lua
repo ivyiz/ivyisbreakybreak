@@ -85,6 +85,9 @@ local CONFIG = {
     stepSeconds = 0.55,
 }
 
+local RECOVER_SECONDS = 15
+local RECOVER_MAX_DIST = 700
+
 local COLORS = {
     bg = Color3.fromRGB(0, 0, 0),
     surface = Color3.fromRGB(11, 11, 11),
@@ -131,6 +134,7 @@ local state = {
     stopRadius = nil,
     intentionalDrop = false,
     carrySnapshot = nil,
+    recover = nil,
     gemJob = nil,
     swingCount = 0,
     approach = nil,
@@ -305,7 +309,20 @@ track(LP:GetAttributeChangedSignal("Carrying"):Connect(function()
             end
         end
     end
-    setStatus(string.format("Pet %s lost - continuing", snapshot.name))
+    if snapshot.cps and snapshot.cps < CONFIG.minCps then
+        setStatus(string.format("Pet %s lost - continuing", snapshot.name))
+        return
+    end
+    state.recover = {
+        name = snapshot.name,
+        cps = snapshot.cps,
+        hatch = snapshot.hatch,
+        pos = r and r.Position or Vector3.zero,
+        zone = r and tostring(ZoneLookup.GetZoneAt(r.Position)) or nil,
+        seen = false,
+        deadline = os.clock() + RECOVER_SECONDS,
+    }
+    setStatus(string.format("Pet %s dropped - recovering...", snapshot.name))
 end))
 
 local function fmt(n)
@@ -691,6 +708,14 @@ local function nearestEgg()
     return best, bestD
 end
 
+local function despawnIn(model)
+    local t = model:GetAttribute("DespawnAtServerTime")
+    if type(t) ~= "number" then
+        return math.huge
+    end
+    return t - Workspace:GetServerTimeNow()
+end
+
 local function findWantedPet()
     local r = root()
     if not r then
@@ -698,7 +723,7 @@ local function findWantedPet()
     end
     local best, bestD = nil, CONFIG.petScanRadius
     for _, m in ipairs(CS:GetTagged("AnimalPickup")) do
-        if m:IsA("Model") and m.Parent and not m:GetAttribute("Despawning") then
+        if m:IsA("Model") and m.Parent and not m:GetAttribute("Despawning") and despawnIn(m) > 5 then
             if (not ignored[m] or ignored[m] < os.clock()) and not inDroppedZone(m:GetPivot().Position) then
                 local reserved = m:GetAttribute("ReservedUserId")
                 if reserved == nil or reserved == LP.UserId then
@@ -913,6 +938,115 @@ local function steal(model)
     return LP:GetAttribute("Carrying") ~= nil
 end
 
+local function recoverStep()
+    local rec = state.recover
+    local now = os.clock()
+    local rr = root()
+    if not rec or not rr or now > rec.deadline then
+        if rec then
+            setStatus(string.format("Pet %s lost - moving on", rec.name))
+        end
+        state.recover = nil
+        return
+    end
+    if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
+        setStatus("Chased - delaying pet recovery")
+        state.pathGoal = dropAnchor()
+        state.moveTarget = state.pathGoal
+        task.wait(0.2)
+        return
+    end
+    local found, bestD = nil, math.huge
+    local takenByOther = false
+    for _, m in ipairs(CS:GetTagged("AnimalPickup")) do
+        if m:IsA("Model") and m.Parent and not m:GetAttribute("Despawning") and despawnIn(m) > 2 then
+            local same = false
+            if rec.hatch ~= nil then
+                same = m:GetAttribute("HatchId") == rec.hatch
+            end
+            if not same and rec.name and m:GetAttribute("AnimalName") == rec.name then
+                local mcps = petCps(m)
+                if mcps and rec.cps and math.abs(mcps - rec.cps) <= rec.cps * 0.02 then
+                    same = true
+                end
+            end
+            if same then
+                local reserved = m:GetAttribute("ReservedUserId")
+                if reserved ~= nil and reserved ~= LP.UserId then
+                    takenByOther = true
+                else
+                    local cps = petCps(m)
+                    if cps and cps >= CONFIG.minCps then
+                        local ok, pivot = pcall(function()
+                            return m:GetPivot().Position
+                        end)
+                        if ok and pivot then
+                            local d = (pivot - rr.Position).Magnitude
+                            if d < bestD then
+                                found, bestD = m, d
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if found then
+        rec.seen = true
+    elseif rec.seen or takenByOther then
+        setStatus(string.format("Pet %s taken - moving on", rec.name))
+        state.recover = nil
+        return
+    end
+    if found then
+        if not guardAllows(rec.zone) then
+            return
+        end
+        setStatus(string.format("Recovering %s (%dm)", rec.name, math.floor(bestD)))
+        if steal(found) then
+            state.pendingCps = petCps(found)
+            state.carrySnapshot = {
+                name = found:GetAttribute("AnimalName"),
+                cps = state.pendingCps,
+                hatch = found:GetAttribute("HatchId"),
+            }
+            state.recover = nil
+            setStatus(string.format("Pet %s recovered", rec.name))
+        else
+            ignored[found] = os.clock() + 30
+            state.recover = nil
+            setStatus(string.format("Pet %s recover failed - moving on", rec.name))
+        end
+        return
+    end
+    local dist = (rr.Position - rec.pos).Magnitude
+    if dist > RECOVER_MAX_DIST then
+        setStatus(string.format("Pet %s too far - moving on", rec.name))
+        state.recover = nil
+        return
+    end
+    if dist > 8 then
+        state.pathGoal = rec.pos
+        state.moveTarget = rec.pos
+        state.stopRadius = 6
+    else
+        stopMove()
+        rec.arrived = rec.arrived or now
+        if now - rec.arrived > 2 then
+            setStatus(string.format("Pet %s gone - moving on", rec.name))
+            state.recover = nil
+            return
+        end
+    end
+    setStatus(string.format(
+        "Recovering %s (%dm, %ds)",
+        rec.name,
+        math.floor(dist),
+        math.max(0, math.ceil(rec.deadline - now))
+    ))
+    task.wait(0.2)
+end
+
 local function dropCarried()
     state.intentionalDrop = true
     for _ = 1, 3 do
@@ -942,13 +1076,18 @@ local updateStats
 local function handleCarried()
     local model = carriedModel()
     local modelCps = model and petCps(model) or nil
-    local cps = state.pendingCps or modelCps
+    local cps = modelCps or state.pendingCps
     local r = root()
     if not r or LP:GetAttribute("Carrying") == nil then
         return
     end
     if model and model:GetAttribute("AnimalName") then
-        state.carrySnapshot = { name = model:GetAttribute("AnimalName"), cps = cps }
+        state.carrySnapshot = {
+            name = model:GetAttribute("AnimalName"),
+            cps = cps,
+            hatch = model:GetAttribute("HatchId")
+                or (state.carrySnapshot and state.carrySnapshot.hatch),
+        }
     end
     state.debug.carry = {
         name = model and model.Name or "?",
@@ -1066,6 +1205,10 @@ local function farmStep(runId)
         return
     end
 
+    if state.recover then
+        recoverStep()
+        return
+    end
 
     if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
         setStatus("Chased - running...")
@@ -1144,7 +1287,11 @@ local function farmStep(runId)
             return
         end
         state.pendingCps = petCps(pet)
-        state.carrySnapshot = { name = pet:GetAttribute("AnimalName"), cps = state.pendingCps }
+        state.carrySnapshot = {
+            name = pet:GetAttribute("AnimalName"),
+            cps = state.pendingCps,
+            hatch = pet:GetAttribute("HatchId"),
+        }
         state.debug.steal = {
             name = pet.Name,
             zone = tostring(ZoneLookup.GetZoneAt(pet:GetPivot().Position)),
@@ -2404,6 +2551,7 @@ function api.start()
     state.orbits = 0
     state.approach = nil
     state.pathGoal = nil
+    state.recover = nil
     updateStats()
     if ui then
         ui.refresh()
@@ -2432,6 +2580,7 @@ function api.stop()
     state.approach = nil
     state.forcePushUntil = 0
     state.pathGoal = nil
+    state.recover = nil
     stopMove()
     setStatus("Stopped")
     pcall(function()
@@ -2467,8 +2616,8 @@ function api.getState()
         guardGate = CONFIG.smartFarm,
         guardZone = state.guardZone,
         guardSafeDist = guardSafeDistFor(),
-        recovering = false,
-        recoverName = nil,
+        recovering = state.recover ~= nil,
+        recoverName = state.recover and state.recover.name or nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
         targetHp = state.targetEgg and state.targetEgg:GetAttribute("Health") or nil,
         targetDepth = state.targetDepth,

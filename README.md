@@ -12,7 +12,7 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 - Strict "wait exact type" mode: if none of the selected eggs are alive it waits instead of farming something else.
 - Minimum CPS filter for pets you pick up while carrying.
 - Auto-drop carried pets at Zone 1 or Safe Zone.
-- If a carried pet is lost (taken by another player, dropped manually or caught by a guard), the script ignores it for 20 s and keeps farming instead of walking back.
+- If a carried pet is knocked out of your hands, the script walks back (max 700 studs, 15 s) to pick up that exact pet again — same HatchId and same CPS. If another player takes it or it despawns, it moves on to another pet or egg immediately.
 - Auto collect gems: after a gem drop the script walks onto the pieces so the magnet picks them up.
 - Smart farm (one toggle): eggs closest to the zone entrance are picked first, and a new steal/egg only starts when the zone's guard is at least 80 studs away. Turning it off disables both the zone-start order and the guard check.
 - Never freezes in place: if the character stops making progress it jumps and sidesteps until it moves again.
