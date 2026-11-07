@@ -78,6 +78,7 @@ local CONFIG = {
     selected = {},
     dropArea = "zone1",
     autoGems = true,
+    evade = true,
     roamRadius = 900,
     petScanRadius = 250,
     stepSeconds = 0.55,
@@ -132,7 +133,11 @@ local state = {
     recover = nil,
     gemJob = nil,
     swingCount = 0,
-    debug = { steal = nil, carry = nil, jumps = 0 },
+    approach = nil,
+    orbits = 0,
+    forcePushUntil = 0,
+    pathGoal = nil,
+    debug = { steal = nil, carry = nil, jumps = 0, dodges = 0 },
 }
 
 local blacklist = {}
@@ -167,7 +172,9 @@ local function root()
     return nil
 end
 
-track(RunService.RenderStepped:Connect(function()
+local TURN_RATE = 10
+
+track(RunService.RenderStepped:Connect(function(dt)
     if not state.moveTarget then
         state.moveDir = nil
         return
@@ -179,20 +186,42 @@ track(RunService.RenderStepped:Connect(function()
     end
     local delta = state.moveTarget - r.Position
     delta = Vector3.new(delta.X, 0, delta.Z)
-    if delta.Magnitude < (state.stopRadius or 0.8) then
+    local dist = delta.Magnitude
+    if dist < (state.stopRadius or 0.8) then
         state.moveDir = nil
         hum:Move(Vector3.zero)
         return
     end
     local desired = delta.Unit
-    if state.moveDir then
-        local currentCF = CFrame.lookAt(Vector3.zero, state.moveDir)
-        local targetCF = CFrame.lookAt(Vector3.zero, desired)
-        state.moveDir = currentCF:Lerp(targetCF, 0.3).LookVector
+    if state.nudge and os.clock() < state.nudge.until_ then
+        desired = (desired + state.nudge.dir * 1.6).Unit
+    end
+    local current = state.moveDir
+    if current and dist > 4 and os.clock() >= state.forcePushUntil then
+        local dot = math.clamp(current:Dot(desired), -1, 1)
+        local angle = math.acos(dot)
+        local step = math.min(angle, TURN_RATE * math.max(dt, 1 / 240))
+        state.moveDir = current:Lerp(desired, step / math.max(angle, 1e-4)).Unit
     else
         state.moveDir = desired
     end
     hum:Move(state.moveDir)
+    local stall = state.stall
+    if not stall or (stall.pos - r.Position).Magnitude > 2 then
+        state.stall = { pos = r.Position, at = os.clock() }
+    elseif os.clock() - stall.at > 0.6 then
+        stall.at = os.clock()
+        state.stall = { pos = r.Position, at = os.clock() }
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            hum.Jump = true
+            state.debug.jumps += 1
+        end
+        local side = Vector3.new(-desired.Z, 0, desired.X)
+        if state.moveDir then
+            side = Vector3.new(-state.moveDir.Z, 0, state.moveDir.X)
+        end
+        state.nudge = { until_ = os.clock() + 0.5, dir = side }
+    end
 end))
 
 local function stopMove()
@@ -586,6 +615,7 @@ local function walkTo(target, maxTime)
     maxTime = maxTime or 30
     local started = os.clock()
     state.stopRadius = 6
+    state.pathGoal = target
     state.moveTarget = target
     local last = nil
     local stuck = 0
@@ -665,25 +695,42 @@ local function flatten(v)
 end
 
 local function steal(model)
-    local pos = model:GetPivot().Position
-    walkTo(pos, 8)
-    state.stopRadius = 2.5
-    state.moveTarget = pos
-    local closeBy = os.clock() + 2
-    while state.running and os.clock() < closeBy do
-        local ch = alive()
+    state.stopRadius = 3.2
+    local deadline = os.clock() + 8
+    local pos = nil
+    while state.running and os.clock() < deadline do
+        if LP:GetAttribute("Carrying") ~= nil then
+            break
+        end
+        if not model.Parent then
+            break
+        end
         local r = root()
-        if not ch or not r then
+        if not r then
             break
         end
-        if (flatten(r.Position) - flatten(pos)).Magnitude <= 2.5 then
+        local ok, pivot = pcall(function()
+            return model:GetPivot().Position
+        end)
+        if not ok or not pivot then
             break
         end
-        state.moveTarget = pos
+        pos = pivot
+        state.pathGoal = pivot
+        state.moveTarget = pivot
+        if (flatten(r.Position) - flatten(pivot)).Magnitude <= 3.2 then
+            break
+        end
         task.wait(0.05)
     end
     stopMove()
-    task.wait(0.3)
+    if LP:GetAttribute("Carrying") ~= nil then
+        return true
+    end
+    if not pos then
+        return false
+    end
+    task.wait(0.2)
     for _ = 1, 3 do
         if LP:GetAttribute("Carrying") ~= nil then
             return true
@@ -698,6 +745,81 @@ local function steal(model)
         end
     end
     return LP:GetAttribute("Carrying") ~= nil
+end
+
+local guardDodge = { until_ = 0, dir = nil, side = 1 }
+
+local function guardThreat()
+    local r = root()
+    if not r then
+        return nil
+    end
+    local best, bestD, bestState = nil, math.huge, nil
+    for _, g in ipairs(CS:GetTagged("ZoneGuard")) do
+        local st = g:GetAttribute("ChaseState")
+        if st == "Chasing" or st == "WindUp" then
+            local owner = g:GetAttribute("CaughtUserId")
+            if owner == nil or owner == LP.UserId then
+                local ok, pivot = pcall(function()
+                    return g:GetPivot().Position
+                end)
+                if ok and pivot then
+                    local d = (flatten(pivot) - flatten(r.Position)).Magnitude
+                    if d < bestD then
+                        best, bestD, bestState = g, d, st
+                    end
+                end
+            end
+        end
+    end
+    return best, bestD, bestState
+end
+
+local function evadeGuard()
+    if not CONFIG.evade then
+        guardDodge.until_ = 0
+        return false
+    end
+    local r = root()
+    local ch, hum = alive()
+    if not r or not hum then
+        return false
+    end
+    local active = os.clock() < guardDodge.until_
+    if not active then
+        local guard, dist, gstate = guardThreat()
+        if not guard then
+            return false
+        end
+        if dist > 45 and gstate ~= "WindUp" then
+            return false
+        end
+        guardDodge.side = -guardDodge.side
+        local away = flatten(r.Position - guard:GetPivot().Position)
+        if away.Magnitude < 0.1 then
+            away = Vector3.new(0, 0, 1)
+        end
+        away = away.Unit
+        local side = Vector3.new(-away.Z, 0, away.X)
+        local anchor = state.pathGoal
+        local goalDir = anchor and flatten(anchor - r.Position) or Vector3.zero
+        if goalDir.Magnitude > 1 then
+            goalDir = goalDir.Unit
+        else
+            goalDir = Vector3.zero
+        end
+        guardDodge.dir = (goalDir * 1.5 + side * 1.3 * guardDodge.side + away * 0.7).Unit
+        guardDodge.until_ = os.clock() + 0.6
+        state.debug.dodges += 1
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            hum.Jump = true
+        end
+        setStatus(string.format("Dodging %s", guard.Name))
+    end
+    state.stopRadius = 1
+    state.moveTarget = r.Position + guardDodge.dir * 20
+    task.wait(0.05)
+    return true
 end
 
 local function dropCarried()
@@ -781,12 +903,17 @@ local function handleCarried()
     state.returnPos = r.Position
     setStatus(string.format("Carrying %s to %s...", model and model.Name or "pet", areaLabel))
     local anchor = dropAnchor()
+    state.pathGoal = anchor
     state.moveTarget = anchor
     local started = os.clock()
     while state.running and os.clock() - started < 180 do
         if LP:GetAttribute("Carrying") == nil then
             break
         end
+        if evadeGuard() then
+            continue
+        end
+        state.moveTarget = anchor
         local p = root()
         if not p then
             break
@@ -851,10 +978,15 @@ local function farmStep(runId)
         return
     end
 
+    if evadeGuard() then
+        return
+    end
+
     if state.recover then
         if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
             setStatus("Chased - delaying pet recovery")
-            state.moveTarget = dropAnchor()
+            state.pathGoal = dropAnchor()
+            state.moveTarget = state.pathGoal
             task.wait(0.2)
             return
         end
@@ -895,6 +1027,7 @@ local function farmStep(runId)
         local dist = (rr.Position - state.recover.pos).Magnitude
         if dist > 20 then
             setStatus("Returning for dropped pet...")
+            state.pathGoal = state.recover.pos
             state.moveTarget = state.recover.pos
             task.wait(0.2)
             return
@@ -906,7 +1039,8 @@ local function farmStep(runId)
 
     if LP:GetAttribute("BeingChased") ~= nil or LP:GetAttribute("PumpkinKingChased") == true then
         setStatus("Chased - running...")
-        state.moveTarget = dropAnchor()
+        state.pathGoal = dropAnchor()
+        state.moveTarget = state.pathGoal
         task.wait(0.2)
         return
     end
@@ -948,6 +1082,7 @@ local function farmStep(runId)
                     setStatus(string.format("Collecting gems (%dm)", math.floor(bestD)))
                     if bestD > 3 then
                         state.stopRadius = 3
+                        state.pathGoal = best.Position
                         state.moveTarget = best.Position
                     else
                         stopMove()
@@ -1019,6 +1154,7 @@ local function farmStep(runId)
             local target = Vector3.new(anchor.X, 0, anchor.Z)
             if (flat - target).Magnitude > 60 then
                 setStatus(string.format("Walking to Zone%d...", z))
+                state.pathGoal = anchor
                 state.moveTarget = anchor
                 task.wait(0.2)
             else
@@ -1048,10 +1184,48 @@ local function farmStep(runId)
 
     local forceApproach = state.forceApproachUntil and os.clock() < state.forceApproachUntil
     if dist > 5.5 or forceApproach then
-        state.stopRadius = forceApproach and 2 or nil
-        state.moveTarget = egg.Position
+        local away = r.Position - egg.Position
+        away = Vector3.new(away.X, 0, away.Z)
+        if away.Magnitude < 0.1 then
+            away = Vector3.new(0, 0, 1)
+        end
+        local ring = math.max(egg.Size.X, egg.Size.Z) / 2 + 2.5
+        local point = Vector3.new(egg.Position.X, egg.Position.Y, egg.Position.Z) + away.Unit * ring
+        state.stopRadius = 1.5
+        state.pathGoal = point
+        state.moveTarget = point
+        if forceApproach then
+            state.forcePushUntil = os.clock() + 0.6
+        end
+        local ap = state.approach
+        if not ap or ap.egg ~= egg then
+            state.approach = { egg = egg, at = os.clock(), moved = 0, dist = dist, lastPos = r.Position, fails = 0 }
+        else
+            ap.moved += (r.Position - ap.lastPos).Magnitude
+            ap.lastPos = r.Position
+            if os.clock() - ap.at > 3 then
+                if ap.moved > 15 and dist > ap.dist - 2 then
+                    ap.fails += 1
+                    state.orbits += 1
+                    state.forcePushUntil = os.clock() + 0.9
+                    if hum.FloorMaterial ~= Enum.Material.Air then
+                        hum.Jump = true
+                        state.debug.jumps += 1
+                    end
+                    if ap.fails >= 3 then
+                        blacklist[egg] = os.clock() + 45
+                        state.targetEgg = nil
+                        state.approach = nil
+                    end
+                end
+                ap.at = os.clock()
+                ap.moved = 0
+                ap.dist = dist
+            end
+        end
         task.wait(0.1)
     else
+        state.approach = nil
         stopMove()
         local swung = false
         pcall(function()
@@ -1118,6 +1292,9 @@ local function loadConfig()
         if type(data.autoGems) == "boolean" then
             CONFIG.autoGems = data.autoGems
         end
+        if type(data.evade) == "boolean" then
+            CONFIG.evade = data.evade
+        end
         if data.version == CONFIG_VERSION and type(data.selected) == "table" then
             for _, name in ipairs(data.selected) do
                 if CATALOG.byName[name] then
@@ -1145,6 +1322,7 @@ function saveConfig()
             minCps = CONFIG.minCps,
             dropArea = CONFIG.dropArea,
             autoGems = CONFIG.autoGems,
+            evade = CONFIG.evade,
             selected = list,
         }))
     end)
@@ -1449,6 +1627,21 @@ local function buildUI()
     gemToggle.Position = UDim2.new(1, 0, 0.5, 0)
     gemToggle.TextSize = 13
 
+    local evadeRow = Instance.new("Frame")
+    evadeRow.Size = UDim2.new(1, 0, 0, 34)
+    evadeRow.BackgroundTransparency = 1
+    evadeRow.LayoutOrder = 4
+    evadeRow.Parent = farmTab
+
+    local evadeLabel = text(evadeRow, "Dodge guards", 14, COLORS.muted)
+    evadeLabel.Size = UDim2.new(1, -80, 1, 0)
+
+    local evadeToggle = makeButton(evadeRow, CONFIG.evade and "On" or "Off", false, 30)
+    evadeToggle.Size = UDim2.fromOffset(70, 30)
+    evadeToggle.AnchorPoint = Vector2.new(1, 0.5)
+    evadeToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    evadeToggle.TextSize = 13
+
     local dropRow = Instance.new("Frame")
     dropRow.Size = UDim2.new(1, 0, 0, 38)
     dropRow.BackgroundTransparency = 1
@@ -1483,10 +1676,10 @@ local function buildUI()
     errorLabel.AutomaticSize = Enum.AutomaticSize.Y
     errorLabel.TextWrapped = true
     errorLabel.Visible = false
-    errorLabel.LayoutOrder = 4
+    errorLabel.LayoutOrder = 5
 
     local toggleButton = makeButton(farmTab, "Start", true, 44)
-    toggleButton.LayoutOrder = 5
+    toggleButton.LayoutOrder = 6
     toggleButton.TextSize = 16
     local toggleStroke = stroke(toggleButton, COLORS.text)
     toggleStroke.Transparency = 1
@@ -1953,6 +2146,15 @@ local function buildUI()
         gemToggle:SetAttribute("pressColor", gemPress)
         gemToggle.BackgroundColor3 = gemBase
         gemToggle.TextColor3 = CONFIG.autoGems and COLORS.accentText or COLORS.text
+        evadeToggle.Text = CONFIG.evade and "On" or "Off"
+        local evadeBase = CONFIG.evade and COLORS.accent or COLORS.surface
+        local evadeHover = CONFIG.evade and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
+        local evadePress = CONFIG.evade and Color3.fromRGB(200, 200, 200) or COLORS.border
+        evadeToggle:SetAttribute("baseColor", evadeBase)
+        evadeToggle:SetAttribute("hoverColor", evadeHover)
+        evadeToggle:SetAttribute("pressColor", evadePress)
+        evadeToggle.BackgroundColor3 = evadeBase
+        evadeToggle.TextColor3 = CONFIG.evade and COLORS.accentText or COLORS.text
         dropButton.Text = dropLabel()
         refreshDropOptions()
         ui.refreshEggButton()
@@ -1997,6 +2199,10 @@ local function buildUI()
 
     gemToggle.MouseButton1Click:Connect(function()
         api.setAutoGems(not CONFIG.autoGems)
+    end)
+
+    evadeToggle.MouseButton1Click:Connect(function()
+        api.setEvade(not CONFIG.evade)
     end)
 
     toggleButton.MouseButton1Click:Connect(function()
@@ -2048,6 +2254,15 @@ end
 
 function api.setAutoGems(value)
     CONFIG.autoGems = value == true
+    saveConfig()
+    if ui then
+        ui.refresh()
+    end
+end
+
+function api.setEvade(value)
+    CONFIG.evade = value == true
+    guardDodge.until_ = 0
     saveConfig()
     if ui then
         ui.refresh()
@@ -2116,6 +2331,9 @@ function api.start()
     state.targetEgg = nil
     state.returnPos = nil
     state.swingCount = 0
+    state.orbits = 0
+    state.approach = nil
+    state.pathGoal = nil
     updateStats()
     if ui then
         ui.refresh()
@@ -2141,6 +2359,10 @@ function api.stop()
     state.lastSwing = nil
     state.forceApproachUntil = nil
     state.gemJob = nil
+    state.approach = nil
+    state.forcePushUntil = 0
+    state.pathGoal = nil
+    guardDodge.until_ = 0
     stopMove()
     setStatus("Stopped")
     pcall(function()
@@ -2171,11 +2393,14 @@ function api.getState()
         dropZone = dropZoneName(),
         dropArea = CONFIG.dropArea,
         autoGems = CONFIG.autoGems,
+        evade = CONFIG.evade,
         recovering = state.recover ~= nil,
         recoverName = state.recover and state.recover.name or nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
         targetHp = state.targetEgg and state.targetEgg:GetAttribute("Health") or nil,
         swings = state.swingCount,
+        orbits = state.orbits,
+        dodges = state.debug.dodges,
         carrying = tostring(LP:GetAttribute("Carrying")),
         steal = state.debug.steal,
         carryInfo = state.debug.carry,
