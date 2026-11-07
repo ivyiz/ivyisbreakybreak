@@ -14,8 +14,7 @@ Egg farming script for **Break and Steal an Egg** (PlaceId `114326934417838`).
 - Auto-drop carried pets at Zone 1 or Safe Zone.
 - Boss pet-drop recovery: if a boss pet is taken from you, the script walks back and re-steals it.
 - Auto collect gems: after a gem drop the script walks onto the pieces so the magnet picks them up.
-- Start-zone eggs first: eggs closest to the zone entrance are always picked first, even if that means walking back.
-- Guard gate: only steals pets or starts a new egg when the nearest ZoneGuard is far enough away (half the zone length).
+- Smart farm (one toggle): eggs closest to the zone entrance are picked first, and a new steal/egg only starts when the zone's guard is at least 120 studs away. Turning it off disables both the zone-start order and the guard check.
 - Never freezes in place: if the character stops making progress it jumps and sidesteps until it moves again.
 - Swing rate follows the game's own cooldown, so pickaxe tiers, the x2 fast-swing gamepass, swing potions and Swinging mastery all apply automatically.
 - Auto rejoin on disconnect.
@@ -39,7 +38,14 @@ The UI opens on load. Pick the zones/eggs, set a minimum CPS, choose the drop ar
 
 ## Guard gate
 
-Before stealing a pet or starting a new egg, the script measures the distance to the **guard of the zone being farmed** (other zones' guards are ignored). The guard must be at least **120 studs** away; while it is closer the script waits, and it will also wait if that guard is actively chasing you. After 30 s of waiting it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt. Change the threshold with `api.setGuardSafeDist(studs)` (0 = default 120).
+## Smart farm
+
+One toggle in the Farm tab controls two things:
+
+- **Start-zone eggs first** — eggs closest to the zone entrance are always picked first, even if that means walking back.
+- **Guard watch** — before stealing a pet or starting a new egg, the script measures the distance to the **guard of the zone being farmed** (other zones' guards are ignored). The guard must be at least **120 studs** away; while it is closer the script waits, and it also waits if that guard is actively chasing you. After 30 s it retreats toward the zone entrance, and after 90 s it ignores the gate for that attempt.
+
+Turning the toggle off disables both: the script picks the nearest egg and ignores guards. `api.setGuardSafeDist(studs)` changes the threshold (0 = default 120).
 
 Run the reconnect companion the same way:
 
@@ -65,8 +71,7 @@ api.clearSelection()
 api.setMin(50e9)                    -- minimum pet CPS to keep
 api.setDropArea("safe")             -- "safe" | "zone1"
 api.setAutoGems(true)               -- walk onto gem drops
-api.setZoneStart(true)              -- eggs near the zone entrance first
-api.setGuardGate(true)              -- wait for guards to move away
+api.setSmartFarm(true)              -- zone-start order + guard watch (both)
 api.setGuardSafeDist(0)             -- 0 = default 120 studs
 ```
 

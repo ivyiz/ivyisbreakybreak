@@ -78,8 +78,7 @@ local CONFIG = {
     selected = {},
     dropArea = "zone1",
     autoGems = true,
-    zoneStart = true,
-    guardGate = true,
+    smartFarm = true,
     guardSafeDist = 0,
     roamRadius = 900,
     petScanRadius = 250,
@@ -546,7 +545,7 @@ end
 local guardWait = { since = 0, retreatUntil = 0 }
 
 local function guardAllows(zoneId)
-    if not CONFIG.guardGate then
+    if not CONFIG.smartFarm then
         return true
     end
     zoneId = type(zoneId) == "string" and zoneId or guardZoneId()
@@ -664,7 +663,7 @@ local function nearestEgg()
             if (blacklist[egg] or 0) < os.clock() and allowed(egg) then
                 local zone = egg:GetAttribute("ZoneIndex")
                 local d = EggTargeting.SurfaceDistance(egg, r.Position)
-                local depth = CONFIG.zoneStart and eggDepth(egg) or nil
+                local depth = CONFIG.smartFarm and eggDepth(egg) or nil
                 local better = false
                 if not bestZone or zone > bestZone then
                     better = true
@@ -1387,11 +1386,12 @@ local function loadConfig()
         if type(data.autoGems) == "boolean" then
             CONFIG.autoGems = data.autoGems
         end
-        if type(data.zoneStart) == "boolean" then
-            CONFIG.zoneStart = data.zoneStart
-        end
-        if type(data.guardGate) == "boolean" then
-            CONFIG.guardGate = data.guardGate
+        if type(data.smartFarm) == "boolean" then
+            CONFIG.smartFarm = data.smartFarm
+        elseif type(data.zoneStart) == "boolean" then
+            CONFIG.smartFarm = data.zoneStart
+        elseif type(data.guardGate) == "boolean" then
+            CONFIG.smartFarm = data.guardGate
         end
         if type(data.guardSafeDist) == "number" then
             CONFIG.guardSafeDist = math.max(0, data.guardSafeDist)
@@ -1423,8 +1423,7 @@ function saveConfig()
             minCps = CONFIG.minCps,
             dropArea = CONFIG.dropArea,
             autoGems = CONFIG.autoGems,
-            zoneStart = CONFIG.zoneStart,
-            guardGate = CONFIG.guardGate,
+            smartFarm = CONFIG.smartFarm,
             guardSafeDist = CONFIG.guardSafeDist,
             selected = list,
         }))
@@ -1765,10 +1764,10 @@ local function buildUI()
     zoneRow.LayoutOrder = 4
     zoneRow.Parent = farmTab
 
-    local zoneLabel = text(zoneRow, "Start-zone eggs first", 14, COLORS.muted)
+    local zoneLabel = text(zoneRow, "Guard watch + zone start", 14, COLORS.muted)
     zoneLabel.Size = UDim2.new(1, -80, 1, 0)
 
-    local zoneToggle = makeButton(zoneRow, CONFIG.zoneStart and "On" or "Off", false, 30)
+    local zoneToggle = makeButton(zoneRow, CONFIG.smartFarm and "On" or "Off", false, 30)
     zoneToggle.Size = UDim2.fromOffset(70, 30)
     zoneToggle.AnchorPoint = Vector2.new(1, 0.5)
     zoneToggle.Position = UDim2.new(1, 0, 0.5, 0)
@@ -2260,7 +2259,7 @@ local function buildUI()
             button.TextColor3 = on and COLORS.accentText or COLORS.text
             button.Text = on and "On" or "Off"
         end
-        styleToggle(zoneToggle, CONFIG.zoneStart)
+        styleToggle(zoneToggle, CONFIG.smartFarm)
         dropButton.Text = dropLabel()
         refreshDropOptions()
         ui.refreshEggButton()
@@ -2308,7 +2307,7 @@ local function buildUI()
     end)
 
     zoneToggle.MouseButton1Click:Connect(function()
-        api.setZoneStart(not CONFIG.zoneStart)
+        api.setSmartFarm(not CONFIG.smartFarm)
     end)
 
     toggleButton.MouseButton1Click:Connect(function()
@@ -2366,20 +2365,21 @@ function api.setAutoGems(value)
     end
 end
 
-function api.setZoneStart(value)
-    CONFIG.zoneStart = value == true
+function api.setSmartFarm(value)
+    CONFIG.smartFarm = value == true
+    guardWait.since = 0
     saveConfig()
     if ui then
         ui.refresh()
     end
 end
 
+function api.setZoneStart(value)
+    api.setSmartFarm(value)
+end
+
 function api.setGuardGate(value)
-    CONFIG.guardGate = value == true
-    saveConfig()
-    if ui then
-        ui.refresh()
-    end
+    api.setSmartFarm(value)
 end
 
 function api.setGuardSafeDist(value)
@@ -2513,8 +2513,9 @@ function api.getState()
         dropZone = dropZoneName(),
         dropArea = CONFIG.dropArea,
         autoGems = CONFIG.autoGems,
-        zoneStart = CONFIG.zoneStart,
-        guardGate = CONFIG.guardGate,
+        smartFarm = CONFIG.smartFarm,
+        zoneStart = CONFIG.smartFarm,
+        guardGate = CONFIG.smartFarm,
         guardZone = state.guardZone,
         guardSafeDist = guardSafeDistFor(),
         recovering = state.recover ~= nil,
