@@ -17,6 +17,7 @@ local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LP = Players.LocalPlayer
 local Shared = RS:WaitForChild("Shared")
@@ -30,6 +31,11 @@ local Controllers = ClientFolder:WaitForChild("Controllers")
 local PickaxeConfig = require(Shared.PickaxeConfig)
 local AutoSwing = require(Controllers:WaitForChild("AutoSwingController"))
 local PickaxeController = require(Controllers:WaitForChild("PickaxeController"))
+local RideRemote = RS:FindFirstChild("RideRemote")
+local RideConfig
+pcall(function()
+    RideConfig = require(Shared.RideConfig)
+end)
 local firePrompt = fireproximityprompt
 
 local function disconnectOldSource(signal)
@@ -79,6 +85,7 @@ local CONFIG = {
     dropArea = "zone1",
     autoGems = true,
     evade = true,
+    autoMount = true,
     roamRadius = 900,
     petScanRadius = 250,
     stepSeconds = 0.55,
@@ -137,6 +144,8 @@ local state = {
     orbits = 0,
     forcePushUntil = 0,
     pathGoal = nil,
+    mounting = false,
+    wDown = false,
     debug = { steal = nil, carry = nil, jumps = 0, dodges = 0 },
 }
 
@@ -145,6 +154,7 @@ local ignored = {}
 local dropGuards = {}
 local inDroppedZone
 local saveConfig
+local dismountNow
 local ui
 local api = {}
 local connections = {}
@@ -174,6 +184,35 @@ end
 
 local TURN_RATE = 10
 
+local function isMounted()
+    return LP:GetAttribute("Mounted") == true
+end
+
+local function setMoveKey(on)
+    if state.wDown == on then
+        return
+    end
+    state.wDown = on
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(on, Enum.KeyCode.W, false, game)
+    end)
+end
+
+local function rideSteer(dir)
+    if not dir then
+        return
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    local flat = Vector3.new(dir.X, 0, dir.Z)
+    if flat.Magnitude < 0.01 then
+        return
+    end
+    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, cam.CFrame.Position + flat.Unit)
+end
+
 track(RunService.RenderStepped:Connect(function(dt)
     if not state.moveTarget then
         state.moveDir = nil
@@ -189,7 +228,9 @@ track(RunService.RenderStepped:Connect(function(dt)
     local dist = delta.Magnitude
     if dist < (state.stopRadius or 0.8) then
         state.moveDir = nil
+        state.moveToAt = nil
         hum:Move(Vector3.zero)
+        setMoveKey(false)
         return
     end
     local desired = delta.Unit
@@ -205,7 +246,17 @@ track(RunService.RenderStepped:Connect(function(dt)
     else
         state.moveDir = desired
     end
-    hum:Move(state.moveDir)
+    if isMounted() then
+        if UIS:GetFocusedTextBox() then
+            setMoveKey(false)
+        else
+            rideSteer(state.moveDir)
+            setMoveKey(true)
+        end
+    else
+        setMoveKey(false)
+        hum:Move(state.moveDir)
+    end
     local stall = state.stall
     if not stall or (stall.pos - r.Position).Magnitude > 2 then
         state.stall = { pos = r.Position, at = os.clock() }
@@ -228,6 +279,8 @@ local function stopMove()
     state.moveTarget = nil
     state.moveDir = nil
     state.stopRadius = nil
+    state.moveToAt = nil
+    setMoveKey(false)
     local _, hum = alive()
     if hum then
         hum:Move(Vector3.zero)
@@ -238,6 +291,9 @@ local function cleanup()
     state.running = false
     state.runId += 1
     stopMove()
+    if dismountNow then
+        pcall(dismountNow)
+    end
     pcall(function()
         AutoSwing.SetOn(false)
     end)
@@ -605,6 +661,146 @@ local function ensureSwing()
         AutoSwing.SetOn(false)
     end)
     return true
+end
+
+local mountState = { name = nil, bonus = nil, fails = 0, lastMount = 0 }
+
+local function rideableTools()
+    local list = {}
+    local backpack = LP:FindFirstChild("Backpack")
+    local ch = LP.Character
+    for _, holder in ipairs({ backpack, ch }) do
+        if holder then
+            for _, tool in ipairs(holder:GetChildren()) do
+                if tool:IsA("Tool") and CS:HasTag(tool, "RideableTool") then
+                    list[#list + 1] = tool
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function speedBonusFor(name)
+    if not RideConfig or type(RideConfig.Animals) ~= "table" then
+        return 0
+    end
+    for _, animal in ipairs(RideConfig.Animals) do
+        if animal.Name == name then
+            return animal.SpeedBonus or 0
+        end
+    end
+    return 0
+end
+
+local function bestRideable()
+    local best, bestName, bestBonus = nil, nil, -1
+    for _, tool in ipairs(rideableTools()) do
+        local name = tool:GetAttribute("RideableName") or tool.Name
+        if type(name) == "string" then
+            local bonus = speedBonusFor(name)
+            if bonus > bestBonus then
+                best, bestName, bestBonus = tool, name, bonus
+            end
+        end
+    end
+    return best, bestName, bestBonus
+end
+
+local function mountUp()
+    if not CONFIG.autoMount or not RideRemote then
+        return false
+    end
+    if isMounted() then
+        return true
+    end
+    local tool, name, bonus = bestRideable()
+    if not tool then
+        return false
+    end
+    mountState.name = name
+    mountState.bonus = bonus
+    for _ = 1, 3 do
+        local ch, hum = alive()
+        if not ch or not hum then
+            return false
+        end
+        if not ch:FindFirstChild(tool.Name) then
+            pcall(function()
+                hum:EquipTool(tool)
+            end)
+        end
+        local started = os.clock()
+        local held = nil
+        while os.clock() - started < 1 do
+            held = LP:GetAttribute("HeldRideable")
+            if type(held) == "string" then
+                break
+            end
+            task.wait(0.05)
+        end
+        if type(held) == "string" then
+            pcall(function()
+                RideRemote:FireServer("Mount", held)
+            end)
+            local mountedAt = os.clock()
+            while os.clock() - mountedAt < 1.2 do
+                if isMounted() then
+                    equipPickaxe()
+                    mountState.fails = 0
+                    mountState.lastMount = os.clock()
+                    return true
+                end
+                task.wait(0.05)
+            end
+        end
+        task.wait(0.2)
+    end
+    mountState.fails += 1
+    return false
+end
+
+dismountNow = function()
+    setMoveKey(false)
+    if not isMounted() then
+        return true
+    end
+    if RideRemote then
+        pcall(function()
+            RideRemote:FireServer("Dismount", nil)
+        end)
+    end
+    local started = os.clock()
+    while os.clock() - started < 1 do
+        if not isMounted() then
+            return true
+        end
+        task.wait(0.05)
+    end
+    return not isMounted()
+end
+
+local function updateMount(dist)
+    if not CONFIG.autoMount then
+        return
+    end
+    if isMounted() then
+        if dist < 80 then
+            dismountNow()
+        end
+        return
+    end
+    if dist < 400 or state.mounting or mountState.fails >= 3 then
+        return
+    end
+    if os.clock() - (mountState.lastMount or 0) < 10 then
+        return
+    end
+    state.mounting = true
+    task.spawn(function()
+        mountUp()
+        state.mounting = false
+    end)
 end
 
 local function walkTo(target, maxTime)
@@ -1152,7 +1348,9 @@ local function farmStep(runId)
             local anchor = zoneAnchor(z)
             local flat = Vector3.new(r0.Position.X, 0, r0.Position.Z)
             local target = Vector3.new(anchor.X, 0, anchor.Z)
-            if (flat - target).Magnitude > 60 then
+            local anchorDist = (flat - target).Magnitude
+            updateMount(anchorDist)
+            if anchorDist > 60 then
                 setStatus(string.format("Walking to Zone%d...", z))
                 state.pathGoal = anchor
                 state.moveTarget = anchor
@@ -1175,6 +1373,7 @@ local function farmStep(runId)
         return
     end
     local dist = EggTargeting.SurfaceDistance(egg, r.Position)
+    updateMount(dist)
     setStatus(string.format(
         "Farming Zone%s · %s (%dm)",
         tostring(egg:GetAttribute("ZoneIndex") or "?"),
@@ -1295,6 +1494,9 @@ local function loadConfig()
         if type(data.evade) == "boolean" then
             CONFIG.evade = data.evade
         end
+        if type(data.autoMount) == "boolean" then
+            CONFIG.autoMount = data.autoMount
+        end
         if data.version == CONFIG_VERSION and type(data.selected) == "table" then
             for _, name in ipairs(data.selected) do
                 if CATALOG.byName[name] then
@@ -1323,6 +1525,7 @@ function saveConfig()
             dropArea = CONFIG.dropArea,
             autoGems = CONFIG.autoGems,
             evade = CONFIG.evade,
+            autoMount = CONFIG.autoMount,
             selected = list,
         }))
     end)
@@ -1642,6 +1845,21 @@ local function buildUI()
     evadeToggle.Position = UDim2.new(1, 0, 0.5, 0)
     evadeToggle.TextSize = 13
 
+    local mountRow = Instance.new("Frame")
+    mountRow.Size = UDim2.new(1, 0, 0, 34)
+    mountRow.BackgroundTransparency = 1
+    mountRow.LayoutOrder = 5
+    mountRow.Parent = farmTab
+
+    local mountLabel = text(mountRow, "Auto mount", 14, COLORS.muted)
+    mountLabel.Size = UDim2.new(1, -80, 1, 0)
+
+    local mountToggle = makeButton(mountRow, CONFIG.autoMount and "On" or "Off", false, 30)
+    mountToggle.Size = UDim2.fromOffset(70, 30)
+    mountToggle.AnchorPoint = Vector2.new(1, 0.5)
+    mountToggle.Position = UDim2.new(1, 0, 0.5, 0)
+    mountToggle.TextSize = 13
+
     local dropRow = Instance.new("Frame")
     dropRow.Size = UDim2.new(1, 0, 0, 38)
     dropRow.BackgroundTransparency = 1
@@ -1676,10 +1894,10 @@ local function buildUI()
     errorLabel.AutomaticSize = Enum.AutomaticSize.Y
     errorLabel.TextWrapped = true
     errorLabel.Visible = false
-    errorLabel.LayoutOrder = 5
+    errorLabel.LayoutOrder = 6
 
     local toggleButton = makeButton(farmTab, "Start", true, 44)
-    toggleButton.LayoutOrder = 6
+    toggleButton.LayoutOrder = 7
     toggleButton.TextSize = 16
     local toggleStroke = stroke(toggleButton, COLORS.text)
     toggleStroke.Transparency = 1
@@ -2155,6 +2373,15 @@ local function buildUI()
         evadeToggle:SetAttribute("pressColor", evadePress)
         evadeToggle.BackgroundColor3 = evadeBase
         evadeToggle.TextColor3 = CONFIG.evade and COLORS.accentText or COLORS.text
+        mountToggle.Text = CONFIG.autoMount and "On" or "Off"
+        local mountBase = CONFIG.autoMount and COLORS.accent or COLORS.surface
+        local mountHover = CONFIG.autoMount and Color3.fromRGB(230, 230, 230) or COLORS.surfaceHover
+        local mountPress = CONFIG.autoMount and Color3.fromRGB(200, 200, 200) or COLORS.border
+        mountToggle:SetAttribute("baseColor", mountBase)
+        mountToggle:SetAttribute("hoverColor", mountHover)
+        mountToggle:SetAttribute("pressColor", mountPress)
+        mountToggle.BackgroundColor3 = mountBase
+        mountToggle.TextColor3 = CONFIG.autoMount and COLORS.accentText or COLORS.text
         dropButton.Text = dropLabel()
         refreshDropOptions()
         ui.refreshEggButton()
@@ -2203,6 +2430,10 @@ local function buildUI()
 
     evadeToggle.MouseButton1Click:Connect(function()
         api.setEvade(not CONFIG.evade)
+    end)
+
+    mountToggle.MouseButton1Click:Connect(function()
+        api.setAutoMount(not CONFIG.autoMount)
     end)
 
     toggleButton.MouseButton1Click:Connect(function()
@@ -2263,6 +2494,19 @@ end
 function api.setEvade(value)
     CONFIG.evade = value == true
     guardDodge.until_ = 0
+    saveConfig()
+    if ui then
+        ui.refresh()
+    end
+end
+
+function api.setAutoMount(value)
+    CONFIG.autoMount = value == true
+    mountState.fails = 0
+    mountState.lastMount = 0
+    if not CONFIG.autoMount then
+        pcall(dismountNow)
+    end
     saveConfig()
     if ui then
         ui.refresh()
@@ -2362,7 +2606,9 @@ function api.stop()
     state.approach = nil
     state.forcePushUntil = 0
     state.pathGoal = nil
+    state.mounting = false
     guardDodge.until_ = 0
+    dismountNow()
     stopMove()
     setStatus("Stopped")
     pcall(function()
@@ -2394,6 +2640,10 @@ function api.getState()
         dropArea = CONFIG.dropArea,
         autoGems = CONFIG.autoGems,
         evade = CONFIG.evade,
+        autoMount = CONFIG.autoMount,
+        mounted = isMounted(),
+        mountName = mountState.name,
+        mountBonus = mountState.bonus,
         recovering = state.recover ~= nil,
         recoverName = state.recover and state.recover.name or nil,
         targetName = state.targetEgg and state.targetEgg:GetAttribute("EggInfoName") or nil,
